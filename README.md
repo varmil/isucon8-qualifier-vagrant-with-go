@@ -24,6 +24,7 @@ bin/bench -remotes=127.0.0.1 -output result.json
 
 ## REQUIREMENT
 ```
+sudo -i -u isucon
 go get -u github.com/oxequa/realize
 go get github.com/joho/godotenv
 ```
