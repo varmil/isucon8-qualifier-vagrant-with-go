@@ -1,22 +1,41 @@
 # vagrant-isucon/isucon8-qualifier-standalone
 
-## Overview
+## OVERVIEW
 
 isucon8予選とほぼ同じ環境を構築するためのVagrantfileです。
 
-## Usage
-
+## USAGE
 - vagrant実行環境を用意する
-- Vagrantfileがあるディレクトリで`vagrant up`を実行する
-  - サーバが1台起動
-- Ansibleによるプロビジョニングが完了したら`vagrant ssh`を実行する
-  - vagrant ssh
-- ベンチマークを実行する
-  - sudo -i -u isucon
-  - cd torb/bench
-  - bin/bench -remotes=127.0.0.1 -output result.json
+- Vagrantfileがあるディレクトリで下記
+  - `vagrant up`
+  - `vagrant rsync-auto` (※ターミナルをもう1枚開いて)
+  - `vagrant ssh`
 
 
+
+## RUN BENCH
+```
+sudo -i -u isucon
+cd torb/bench
+bin/bench -remotes=127.0.0.1 -output result.json
+```
+
+
+
+## REQUIREMENT
+```
+go get -u github.com/oxequa/realize
+go get github.com/joho/godotenv
+```
+
+
+
+## HOW TO SERVE
+```
+sudo -i -u isucon
+cd /home/isucon/torb/webapp/go
+GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/torb" --run
+```
 
 ## 動作確認
 
