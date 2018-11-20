@@ -12,7 +12,7 @@
  *
  * ### SCORE LOG
  *  800 : SELECT FOR UPDATE が無駄に見えたので削除。
- * 4810 : getEvent() のN+1を解決
+ * 4810 : getEvent() の reservations テーブルSELECTに関して N+1を解決
  */
 package main
 
