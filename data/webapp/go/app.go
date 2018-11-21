@@ -12,8 +12,8 @@
  *
  * ### SCORE LOG
  *  800 : SELECT FOR UPDATE が無駄に見えたので削除。
- * 4810 : getEvent() の reservations テーブルSELECTに関して N+1を解決
- * 7664 : go-cacheを用いてsheetsをslice格納してキャッシュ
+ * 4810 : getEvent() の reservations テーブルSELECTに関して N+1を解決。
+ * 9000 : go-cacheを用いてsheetsをslice格納してキャッシュ。この時点でgetEvent()はもはやボトルネックではないが、まだ /api/events/:id/actions/reserve 自体は遅い。
  */
 package main
 
@@ -230,6 +230,9 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 		events = append(events, &event)
 	}
+
+	bfTime := time.Now()
+
 	for i, v := range events {
 		event, err := getEvent(v.ID, -1)
 		if err != nil {
@@ -240,6 +243,11 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 		events[i] = event
 	}
+
+	afTime := time.Now()
+	log.Printf("[getEvents] for loop len: %v", len(events))
+	log.Printf("[getEvents] for loop with getEvent() TIME: %f", afTime.Sub(bfTime).Seconds())
+
 	return events, nil
 }
 
@@ -670,7 +678,7 @@ func main() {
 			return err
 		}
 
-		bfTime := time.Now()
+		// bfTime := time.Now()
 
 		event, err := getEvent(eventID, user.ID)
 		if err != nil {
@@ -686,8 +694,8 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		afTime := time.Now()
-		log.Printf("TIME: %f", afTime.Sub(bfTime).Seconds())
+		// afTime := time.Now()
+		// log.Printf("TIME: %f", afTime.Sub(bfTime).Seconds())
 
 		var sheet Sheet
 		var reservationID int64
@@ -962,7 +970,7 @@ func main() {
 			return err
 		}
 
-		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC FOR UPDATE", event.ID)
+		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC", event.ID)
 		if err != nil {
 			return err
 		}
