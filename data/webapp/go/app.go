@@ -256,34 +256,29 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 
 	// ----- sheets テーブルは不変なのでキャッシュ -----
 	var sheets []Sheet
-	// if x, found := goCache.Get("sheetsSlice"); found {
-	// 	log.Printf("HIT !")
-	// 	// ### copy slice
-	// 	// var src = x.([]Sheet)
-	// 	// sheets = make([]Sheet, len(src))
-	// 	// copy(sheets, src)
-	// 	// ### original
-	// 	sheets = x.([]Sheet)
-	// } else {
-	log.Printf("not-hit")
-	sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-	if err != nil {
-		log.Fatal(err)
-		return nil, err
-	}
-	defer sheetsRows.Close()
-
-	for sheetsRows.Next() {
-		var sheet Sheet
-		if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+	if x, found := goCache.Get("sheetsSlice"); found {
+		// log.Printf("HIT !")
+		sheets = x.([]Sheet)
+	} else {
+		log.Printf("not-hit")
+		sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+		if err != nil {
 			log.Fatal(err)
 			return nil, err
 		}
-		sheets = append(sheets, sheet)
-	}
+		defer sheetsRows.Close()
 
-	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
-	// }
+		for sheetsRows.Next() {
+			var sheet Sheet
+			if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+			sheets = append(sheets, sheet)
+		}
+
+		goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
+	}
 	// ---------------------------------------
 
 	// ----- まず reservations 全部取得。その後APサーバで処理 -----
@@ -315,15 +310,21 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		// 	return nil, err
 		// }
 
-		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
+		sheetCopy := Sheet{
+			ID:    sheet.ID,
+			Rank:  sheet.Rank,
+			Num:   sheet.Num,
+			Price: sheet.Price,
+		}
+
+		event.Sheets[sheetCopy.Rank].Price = event.Price + sheetCopy.Price
 		event.Total++
-		event.Sheets[sheet.Rank].Total++
+		event.Sheets[sheetCopy.Rank].Total++
 
 		// sheet_idでfind
 		var reservation Reservation
-		for i, v := range reservations {
-			if v.SheetID == sheet.ID {
-				// log.Printf("eid %v, shhetid %d, rid: %v", eventID, v.SheetID, i)
+		for _, v := range reservations {
+			if v.SheetID == sheetCopy.ID {
 				reservation = *v
 				break
 			}
@@ -332,15 +333,15 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		if (Reservation{}) == reservation {
 			// そのシートに予約が入っていない場合
 			event.Remains++
-			event.Sheets[sheet.Rank].Remains++
+			event.Sheets[sheetCopy.Rank].Remains++
 		} else {
 			// シートに予約が入っている場合、最もReservedAtが早いものを取得
-			sheet.Mine = reservation.UserID == loginUserID
-			sheet.Reserved = true
-			sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
+			sheetCopy.Mine = reservation.UserID == loginUserID
+			sheetCopy.Reserved = true
+			sheetCopy.ReservedAtUnix = reservation.ReservedAt.Unix()
 		}
 
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
+		event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
 	}
 	// ---------------------------------------
 
