@@ -39,7 +39,10 @@ import (
 	"github.com/labstack/echo/middleware"
 
 	"github.com/joho/godotenv"
+	"github.com/patrickmn/go-cache"
 )
+
+var goCache *cache.Cache
 
 type User struct {
 	ID        int64  `json:"id,omitempty"`
@@ -251,11 +254,37 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		"C": &Sheets{},
 	}
 
+	// ----- sheets テーブルは不変なのでキャッシュ -----
+	var sheets []Sheet
+	// if x, found := goCache.Get("sheetsSlice"); found {
+	// 	log.Printf("HIT !")
+	// 	// ### copy slice
+	// 	// var src = x.([]Sheet)
+	// 	// sheets = make([]Sheet, len(src))
+	// 	// copy(sheets, src)
+	// 	// ### original
+	// 	sheets = x.([]Sheet)
+	// } else {
+	log.Printf("not-hit")
 	sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
 	if err != nil {
+		log.Fatal(err)
 		return nil, err
 	}
 	defer sheetsRows.Close()
+
+	for sheetsRows.Next() {
+		var sheet Sheet
+		if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			log.Fatal(err)
+			return nil, err
+		}
+		sheets = append(sheets, sheet)
+	}
+
+	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
+	// }
+	// ---------------------------------------
 
 	// ----- まず reservations 全部取得。その後APサーバで処理 -----
 	var reservations []*Reservation
@@ -280,19 +309,21 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	// ---------------------------------------
 
 	// ----- シートを走査 -----
-	for sheetsRows.Next() {
-		var sheet Sheet
-		if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			return nil, err
-		}
+	for _, sheet := range sheets {
+		// var sheet Sheet
+		// if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+		// 	return nil, err
+		// }
+
 		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
 		event.Total++
 		event.Sheets[sheet.Rank].Total++
 
 		// sheet_idでfind
 		var reservation Reservation
-		for _, v := range reservations {
+		for i, v := range reservations {
 			if v.SheetID == sheet.ID {
+				// log.Printf("eid %v, shhetid %d, rid: %v", eventID, v.SheetID, i)
 				reservation = *v
 				break
 			}
@@ -380,6 +411,10 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+
+	// go-cache
+	goCache = cache.New(5*time.Minute, 10*time.Minute)
+	log.Printf("GO_CACHE %v", goCache)
 
 	e := echo.New()
 	funcs := template.FuncMap{
