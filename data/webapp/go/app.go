@@ -8,6 +8,14 @@
  * sudo -i -u isucon
  * cd /home/isucon/torb/webapp/go
  * GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/torb" --run
+ *
+ *
+ * ### SCORE LOG
+ *   800  : SELECT FOR UPDATE が無駄に見えたので削除。
+ *  4810  : getEvent() の reservations テーブルSELECTに関して N+1を解決。
+ *  7700  : go-cacheを用いてsheetsをslice格納してキャッシュ。この時点でgetEvent()はもはやボトルネックではないが、まだ /api/events/:id/actions/reserve 自体は遅い。
+ *  9510  : getEvents()が内部で大量にgetEvent()をcallしていたので、呼出回数を実質１回にした。 /api/users/:id が次のボトルネックっぽい。
+ * 26078  : WIP getEventsInをcacheしたがrace conditionで弾かれるので、ロックを入れないと駄目かも
  */
 package main
 
@@ -27,6 +35,8 @@ import (
 	"strings"
 	"time"
 
+	funk "github.com/thoas/go-funk"
+
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/labstack/echo"
@@ -34,7 +44,10 @@ import (
 	"github.com/labstack/echo/middleware"
 
 	"github.com/joho/godotenv"
+	"github.com/patrickmn/go-cache"
 )
+
+var goCache *cache.Cache
 
 type User struct {
 	ID        int64  `json:"id,omitempty"`
@@ -95,6 +108,12 @@ type Administrator struct {
 	Nickname  string `json:"nickname,omitempty"`
 	LoginName string `json:"login_name,omitempty"`
 	PassHash  string `json:"pass_hash,omitempty"`
+}
+
+func arrayToString(a []int64, delim string) string {
+	return strings.Trim(strings.Replace(fmt.Sprint(a), " ", delim, -1), "[]")
+	//return strings.Trim(strings.Join(strings.Split(fmt.Sprint(a), " "), delim), "[]")
+	//return strings.Trim(strings.Join(strings.Fields(fmt.Sprint(a)), delim), "[]")
 }
 
 func sessUserID(c echo.Context) int64 {
@@ -221,16 +240,139 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 		events = append(events, &event)
 	}
-	for i, v := range events {
-		event, err := getEvent(v.ID, -1)
+
+	bfTime := time.Now()
+
+	ids := funk.Map(events, func(x *Event) int64 {
+		return x.ID
+	})
+	addedEvents, err := getEventsIn(ids.([]int64), -1)
+	for i := range addedEvents {
+		for k := range addedEvents[i].Sheets {
+			addedEvents[i].Sheets[k].Detail = nil
+		}
+		events[i] = addedEvents[i]
+	}
+
+	// for i, v := range events {
+	// 	event, err := getEvent(v.ID, -1)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	for k := range event.Sheets {
+	// 		event.Sheets[k].Detail = nil
+	// 	}
+	// 	events[i] = event
+	// }
+
+	// pp.Print(events)
+
+	afTime := time.Now()
+	log.Printf("[getEvents] for loop with getEvent() TIME: %f", afTime.Sub(bfTime).Seconds())
+
+	return events, nil
+}
+
+func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
+	var events []*Event
+	var reservations []*Reservation
+	inClause := arrayToString(eventIDs, ",")
+	log.Print(inClause)
+
+	// EVENTS
+	{
+		sql := fmt.Sprintf("SELECT * FROM events WHERE id IN (%s)", inClause)
+		eventRows, err := db.Query(sql)
 		if err != nil {
+			log.Fatal(err)
 			return nil, err
 		}
-		for k := range event.Sheets {
-			event.Sheets[k].Detail = nil
+		defer eventRows.Close()
+		for eventRows.Next() {
+			var event Event
+			if err := eventRows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+
+			event.Sheets = map[string]*Sheets{
+				"S": &Sheets{},
+				"A": &Sheets{},
+				"B": &Sheets{},
+				"C": &Sheets{},
+			}
+			events = append(events, &event)
 		}
-		events[i] = event
 	}
+
+	// RESERVATIONS
+	{
+		// =========
+		bfTime := time.Now()
+		// =========
+
+		// search the cache for each item
+		var eventIDsForSearching []int64
+		for _, eid := range eventIDs {
+			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)); found {
+				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
+				log.Print("HHHHHIT")
+				reservationsForEventID := x.([]*Reservation)
+				reservations = append(reservations, reservationsForEventID...)
+			} else {
+				// 見つからなければ、検索用IDに追加
+				eventIDsForSearching = append(eventIDsForSearching, eid)
+			}
+		}
+
+		// SELECT query (slow!)
+		if len(eventIDsForSearching) > 0 {
+			sql := fmt.Sprintf("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (%s) AND canceled_at IS NULL", arrayToString(eventIDsForSearching, ","))
+			reservationsRows, err := db.Query(sql)
+			if err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+			defer reservationsRows.Close()
+			for reservationsRows.Next() {
+				var reservation Reservation
+				if err := reservationsRows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+					log.Fatal(err)
+					return nil, err
+				}
+				reservations = append(reservations, &reservation)
+			}
+			// sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
+
+			// set each item in the cache
+			for _, eid := range eventIDs {
+				r := funk.Filter(reservations, func(x *Reservation) bool {
+					return x.EventID == eid
+				})
+				if r != nil {
+					reservationsForEventID := r.([]*Reservation)
+					goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(eid, 10), reservationsForEventID, cache.DefaultExpiration)
+				}
+			}
+		}
+
+		sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
+
+		// =========
+		afTime := time.Now()
+		log.Printf("##### RRR TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// =========
+	}
+
+	// ADD INFO
+	for i := range events {
+		err := addEventInfo(events[i], reservations, loginUserID)
+		if err != nil {
+			log.Fatal(err)
+			return nil, err
+		}
+	}
+
 	return events, nil
 }
 
@@ -246,38 +388,84 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		"C": &Sheets{},
 	}
 
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	// ----- まず reservations 全部取得。その後APサーバで処理 -----
+	var reservations []*Reservation
+	reservationsRows, err := db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id = ? AND canceled_at IS NULL", event.ID)
 	if err != nil {
+		log.Fatal(err)
 		return nil, err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var sheet Sheet
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			return nil, err
-		}
-		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-		event.Total++
-		event.Sheets[sheet.Rank].Total++
-
+	defer reservationsRows.Close()
+	for reservationsRows.Next() {
 		var reservation Reservation
-		err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
-		if err == nil {
-			sheet.Mine = reservation.UserID == loginUserID
-			sheet.Reserved = true
-			sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
-		} else if err == sql.ErrNoRows {
-			event.Remains++
-			event.Sheets[sheet.Rank].Remains++
-		} else {
+		if err := reservationsRows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+			log.Fatal(err)
 			return nil, err
 		}
-
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
+		reservations = append(reservations, &reservation)
 	}
+	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
+	// for _, p := range reservations {
+	// 	fmt.Printf("### %v ### ReservedAtでSort(Not-Stable):%+v\n", eventID, p.ReservedAt)
+	// }
+	// ---------------------------------------
+
+	// ----- シートを走査 ----------------------
+	err = addEventInfo(&event, reservations, loginUserID)
+	if err != nil {
+		log.Fatal(err)
+		return nil, err
+	}
+	// ---------------------------------------
 
 	return &event, nil
+}
+
+func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
+	// ----- sheets テーブルは不変なのでキャッシュしている -----
+	var sheets []Sheet
+	if x, found := goCache.Get("sheetsSlice"); found {
+		sheets = x.([]Sheet)
+	} else {
+		log.Fatal("SHEETS CACHE NOT FOUND")
+	}
+
+	for _, sheet := range sheets {
+		sheetCopy := Sheet{
+			ID:    sheet.ID,
+			Rank:  sheet.Rank,
+			Num:   sheet.Num,
+			Price: sheet.Price,
+		}
+
+		event.Sheets[sheetCopy.Rank].Price = event.Price + sheetCopy.Price
+		event.Total++
+		event.Sheets[sheetCopy.Rank].Total++
+
+		// sheet_idでfind
+		var reservation Reservation
+		for _, v := range reservations {
+			if v.SheetID == sheetCopy.ID && event.ID == v.EventID {
+				reservation = *v
+				break
+			}
+		}
+
+		if (Reservation{}) == reservation {
+			// そのシートに予約が入っていない場合
+			event.Remains++
+			event.Sheets[sheetCopy.Rank].Remains++
+		} else {
+			// シートに予約が入っている場合、最もReservedAtが早いものを取得
+			sheetCopy.Mine = reservation.UserID == loginUserID
+			sheetCopy.Reserved = true
+			sheetCopy.ReservedAtUnix = reservation.ReservedAt.Unix()
+		}
+
+		event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
+	}
+
+	return nil
 }
 
 func sanitizeEvent(e *Event) *Event {
@@ -324,6 +512,7 @@ var db *sql.DB
 
 func main() {
 	var err error
+	// log.SetFlags(log.Lshortfile)
 
 	{
 		err := godotenv.Load("../env.sh")
@@ -345,6 +534,28 @@ func main() {
 		}
 	}
 
+	// go-cache
+	goCache = cache.New(60*time.Minute, 120*time.Minute)
+	{
+		log.Printf("sheets not-hit, so will be cahed")
+		var sheets []Sheet
+		sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer sheetsRows.Close()
+
+		for sheetsRows.Next() {
+			var sheet Sheet
+			if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+				log.Fatal(err)
+			}
+			sheets = append(sheets, sheet)
+		}
+
+		goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
+	}
+
 	e := echo.New()
 	funcs := template.FuncMap{
 		"encode_json": func(v interface{}) string {
@@ -356,7 +567,10 @@ func main() {
 		templates: template.Must(template.New("").Delims("[[", "]]").Funcs(funcs).ParseGlob("views/*.tmpl")),
 	}
 	e.Use(session.Middleware(sessions.NewCookieStore([]byte("secret"))))
-	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{Output: os.Stderr}))
+	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
+		Format: "method=${method}, uri=${uri}, status=${status}, latency_human=${latency_human}\n",
+		Output: os.Stderr,
+	}))
 	e.Static("/", "public")
 	e.GET("/", func(c echo.Context) error {
 		events, err := getEvents(false)
@@ -451,28 +665,56 @@ func main() {
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num); err != nil {
 				return err
 			}
-
-			event, err := getEvent(reservation.EventID, -1)
-			if err != nil {
-				return err
-			}
-			price := event.Sheets[sheet.Rank].Price
-			event.Sheets = nil
-			event.Total = 0
-			event.Remains = 0
-
-			reservation.Event = event
 			reservation.SheetRank = sheet.Rank
 			reservation.SheetNum = sheet.Num
-			reservation.Price = price
 			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
 			if reservation.CanceledAt != nil {
 				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
 			}
 			recentReservations = append(recentReservations, reservation)
 		}
+
 		if recentReservations == nil {
 			recentReservations = make([]Reservation, 0)
+		} else {
+			// eventまとめてfetch
+			eventIDs := funk.Map(recentReservations, func(x Reservation) int64 {
+				return x.EventID
+			})
+
+			// =========
+			bfTime := time.Now()
+			// =========
+
+			events, err := getEventsIn(eventIDs.([]int64), -1)
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+
+			// =========
+			afTime := time.Now()
+			log.Printf("##### TIME: %f #####", afTime.Sub(bfTime).Seconds())
+			// =========
+
+			for i := range recentReservations {
+				// 複数event取得後にアプリケーション側でFind
+				found := funk.Find(events, func(x *Event) bool {
+					return x.ID == recentReservations[i].EventID
+				})
+				foundEvent := found.(*Event)
+
+				// 同じEventIDの場合あるので構造体のコピーが必要
+				cloned := *foundEvent
+
+				price := cloned.Sheets[recentReservations[i].SheetRank].Price
+				cloned.Sheets = nil
+				cloned.Total = 0
+				cloned.Remains = 0
+
+				recentReservations[i].Price = price
+				recentReservations[i].Event = &cloned
+			}
 		}
 
 		var totalPrice int
@@ -623,6 +865,23 @@ func main() {
 				return err
 			}
 
+			// set to cache before update DB
+			{
+				goCache.Delete("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10))
+
+				// time := time.Now().UTC()
+				// reservation := Reservation{EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time}
+				// if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
+				// 	// 見つかったら結果配列にconcatして、再度SET
+				// 	log.Print("INSERTTT")
+				// 	reservationsForEventID := x.([]*Reservation)
+				// 	reservationsForEventID = append(reservationsForEventID, &reservation)
+				// 	goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
+				// } else {
+				// 	// 手抜き。見つからなければ、何もしない。（本来追加すべき？）
+				// }
+			}
+
 			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
 			if err != nil {
 				tx.Rollback()
@@ -643,6 +902,7 @@ func main() {
 
 			break
 		}
+
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
@@ -700,6 +960,17 @@ func main() {
 		if reservation.UserID != user.ID {
 			tx.Rollback()
 			return resError(c, "not_permitted", 403)
+		}
+
+		// update cache before update DB
+		{
+			goCache.Delete("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10))
+			// if _, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
+			// 	// 手抜き。見つかったらキーをDELETE。本来UPDATEすべき
+			// 	log.Print("UPDAAAAAAATE")
+			// 	// reservationsForEventID := x.([]*Reservation)
+			// 	// .Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
+			// }
 		}
 
 		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
@@ -875,7 +1146,7 @@ func main() {
 			return err
 		}
 
-		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC FOR UPDATE", event.ID)
+		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC", event.ID)
 		if err != nil {
 			return err
 		}
@@ -904,8 +1175,10 @@ func main() {
 		}
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
+
+	// NOT TOUCH ME: ベンチには関係ないが、対策しないと途中で叩かれるっぽいのでDB詰まるかも
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id order by reserved_at asc for update")
+		rows, err := db.Query("select r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id order by reserved_at asc")
 		if err != nil {
 			return err
 		}
@@ -916,7 +1189,7 @@ func main() {
 			var reservation Reservation
 			var sheet Sheet
 			var event Event
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.ID, &event.Price); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.ID, &event.Price); err != nil {
 				return err
 			}
 			report := Report{
