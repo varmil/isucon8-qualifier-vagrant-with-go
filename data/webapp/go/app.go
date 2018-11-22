@@ -14,6 +14,7 @@
  *  800 : SELECT FOR UPDATE が無駄に見えたので削除。
  * 4810 : getEvent() の reservations テーブルSELECTに関して N+1を解決。
  * 7700 : go-cacheを用いてsheetsをslice格納してキャッシュ。この時点でgetEvent()はもはやボトルネックではないが、まだ /api/events/:id/actions/reserve 自体は遅い。
+ * 9510 : getEvents()が内部で大量にgetEvent()をcallしていたので、呼出回数を実質１回にした。 /api/users/:id が次のボトルネックっぽい。
  */
 package main
 
@@ -275,7 +276,7 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var events []*Event
 	var reservations []*Reservation
 	inClause := arrayToString(eventIDs, ",")
-	log.Print(inClause)
+	// log.Print(inClause)
 
 	// EVENTS
 	{
@@ -397,14 +398,14 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 			Price: sheet.Price,
 		}
 
-		(*event).Sheets[sheetCopy.Rank].Price = (*event).Price + sheetCopy.Price
-		(*event).Total++
-		(*event).Sheets[sheetCopy.Rank].Total++
+		event.Sheets[sheetCopy.Rank].Price = event.Price + sheetCopy.Price
+		event.Total++
+		event.Sheets[sheetCopy.Rank].Total++
 
 		// sheet_idでfind
 		var reservation Reservation
 		for _, v := range reservations {
-			if v.SheetID == sheetCopy.ID && (*event).ID == v.EventID {
+			if v.SheetID == sheetCopy.ID && event.ID == v.EventID {
 				reservation = *v
 				break
 			}
@@ -412,8 +413,8 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 
 		if (Reservation{}) == reservation {
 			// そのシートに予約が入っていない場合
-			(*event).Remains++
-			(*event).Sheets[sheetCopy.Rank].Remains++
+			event.Remains++
+			event.Sheets[sheetCopy.Rank].Remains++
 		} else {
 			// シートに予約が入っている場合、最もReservedAtが早いものを取得
 			sheetCopy.Mine = reservation.UserID == loginUserID
@@ -421,7 +422,7 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 			sheetCopy.ReservedAtUnix = reservation.ReservedAt.Unix()
 		}
 
-		(*event).Sheets[sheetCopy.Rank].Detail = append((*event).Sheets[sheetCopy.Rank].Detail, &sheetCopy)
+		event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
 	}
 
 	return nil
@@ -471,6 +472,7 @@ var db *sql.DB
 
 func main() {
 	var err error
+	// log.SetFlags(log.Lshortfile)
 
 	{
 		err := godotenv.Load("../env.sh")
@@ -623,28 +625,46 @@ func main() {
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num); err != nil {
 				return err
 			}
-
-			event, err := getEvent(reservation.EventID, -1)
-			if err != nil {
-				return err
-			}
-			price := event.Sheets[sheet.Rank].Price
-			event.Sheets = nil
-			event.Total = 0
-			event.Remains = 0
-
-			reservation.Event = event
 			reservation.SheetRank = sheet.Rank
 			reservation.SheetNum = sheet.Num
-			reservation.Price = price
 			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
 			if reservation.CanceledAt != nil {
 				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
 			}
 			recentReservations = append(recentReservations, reservation)
 		}
+
 		if recentReservations == nil {
 			recentReservations = make([]Reservation, 0)
+		} else {
+			// eventまとめてfetch
+			eventIDs := funk.Map(recentReservations, func(x Reservation) int64 {
+				return x.EventID
+			})
+			events, err := getEventsIn(eventIDs.([]int64), -1)
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+
+			for i := range recentReservations {
+				// 複数event取得後にアプリケーション側でFind
+				found := funk.Find(events, func(x *Event) bool {
+					return x.ID == recentReservations[i].EventID
+				})
+				foundEvent := found.(*Event)
+
+				// 同じEventIDの場合あるので構造体のコピーが必要
+				cloned := *foundEvent
+
+				price := cloned.Sheets[recentReservations[i].SheetRank].Price
+				cloned.Sheets = nil
+				cloned.Total = 0
+				cloned.Remains = 0
+
+				recentReservations[i].Price = price
+				recentReservations[i].Event = &cloned
+			}
 		}
 
 		var totalPrice int
