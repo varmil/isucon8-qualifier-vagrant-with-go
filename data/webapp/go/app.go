@@ -855,6 +855,16 @@ func main() {
 		for {
 			log.Printf("FOR LOOOOOOP eid: %v", eventID)
 
+			// TODO: get from cache
+			// if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
+			// 	reservationsForEventID := x.([]*Reservation)
+			// 	sheetIDs := funk.Map(reservationsForEventID, func(x *Reservation) int64 {
+			// 		return x.SheetID
+			// 	})
+			// } else {
+			// 	// 手抜き。見つからなければ、何もしない。（本来追加すべき？）
+			// }
+
 			if err := db.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL) AND `rank` = ? ORDER BY RAND() LIMIT 1", event.ID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 				if err == sql.ErrNoRows {
 					return resError(c, "sold_out", 409)
@@ -885,25 +895,25 @@ func main() {
 				continue
 			}
 
-			// delete cache after commit DB
-			{
-				log.Printf("Cache DEL with INSERT eid: %v", event.ID)
-				goCache.Delete("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10))
-
-				// time := time.Now().UTC()
-				// reservation := Reservation{EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time}
-				// if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
-				// 	// 見つかったら結果配列にconcatして、再度SET
-				// 	log.Print("INSERTTT")
-				// 	reservationsForEventID := x.([]*Reservation)
-				// 	reservationsForEventID = append(reservationsForEventID, &reservation)
-				// 	goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
-				// } else {
-				// 	// 手抜き。見つからなければ、何もしない。（本来追加すべき？）
-				// }
-			}
-
 			break
+		}
+
+		// insert the reservation into cache after commit DB
+		{
+			// log.Printf("Cache DEL with INSERT eid: %v", event.ID)
+			// goCache.Delete("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10))
+
+			var reservationsForEventID []*Reservation
+			time := time.Now().UTC()
+			reservation := Reservation{EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time}
+			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
+				// 見つかったら結果配列に既存要素をぶち込む
+				reservationsForEventID = x.([]*Reservation)
+			} else {
+				// 見つからなければ、何もしない。
+			}
+			reservationsForEventID = append(reservationsForEventID, &reservation)
+			goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
 		}
 
 		return c.JSON(202, echo.Map{
