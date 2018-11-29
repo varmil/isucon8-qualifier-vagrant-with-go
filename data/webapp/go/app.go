@@ -276,9 +276,8 @@ func getEvents(all bool) ([]*Event, error) {
 
 func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var events []*Event
-	var reservations []*Reservation
 	inClause := arrayToString(eventIDs, ",")
-	log.Print(inClause)
+	// log.Print(inClause)
 
 	// EVENTS
 	{
@@ -307,60 +306,22 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	}
 
 	// RESERVATIONS
+	var reservations []*Reservation
 	{
 		// =========
-		bfTime := time.Now()
+		// bfTime := time.Now()
 		// =========
 
-		// search the cache for each item
-		var eventIDsForSearching []int64
-		for _, eid := range eventIDs {
-			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)); found {
-				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-				log.Printf("Cache HIT eid: %v", eid)
-				reservationsForEventID := x.([]*Reservation)
-				reservations = append(reservations, reservationsForEventID...)
-			} else {
-				// 見つからなければ、検索用IDに追加
-				eventIDsForSearching = append(eventIDsForSearching, eid)
-			}
+		var err error
+		reservations, err = fetchAndCacheReservations(eventIDs)
+		if err != nil {
+			log.Fatal(err)
+			return nil, err
 		}
-
-		// SELECT query (slow!)
-		if len(eventIDsForSearching) > 0 {
-			sql := fmt.Sprintf("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (%s) AND canceled_at IS NULL", arrayToString(eventIDsForSearching, ","))
-			reservationsRows, err := db.Query(sql)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			defer reservationsRows.Close()
-			for reservationsRows.Next() {
-				var reservation Reservation
-				if err := reservationsRows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
-					log.Fatal(err)
-					return nil, err
-				}
-				reservations = append(reservations, &reservation)
-			}
-
-			// set each item in the cache
-			for _, eid := range eventIDs {
-				r := funk.Filter(reservations, func(x *Reservation) bool {
-					return x.EventID == eid
-				})
-				if r != nil {
-					reservationsForEventID := r.([]*Reservation)
-					goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(eid, 10), reservationsForEventID, cache.DefaultExpiration)
-				}
-			}
-		}
-
-		sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
 
 		// =========
-		afTime := time.Now()
-		log.Printf("##### RRR TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// afTime := time.Now()
+		// log.Printf("##### RRR TIME: %f #####", afTime.Sub(bfTime).Seconds())
 		// =========
 	}
 
@@ -390,24 +351,14 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 
 	// ----- まず reservations 全部取得。その後APサーバで処理 -----
 	var reservations []*Reservation
-	reservationsRows, err := db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id = ? AND canceled_at IS NULL", event.ID)
-	if err != nil {
-		log.Fatal(err)
-		return nil, err
-	}
-	defer reservationsRows.Close()
-	for reservationsRows.Next() {
-		var reservation Reservation
-		if err := reservationsRows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+	var err error
+	{
+		reservations, err = fetchAndCacheReservations([]int64{eventID})
+		if err != nil {
 			log.Fatal(err)
 			return nil, err
 		}
-		reservations = append(reservations, &reservation)
 	}
-	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
-	// for _, p := range reservations {
-	// 	fmt.Printf("### %v ### ReservedAtでSort(Not-Stable):%+v\n", eventID, p.ReservedAt)
-	// }
 	// ---------------------------------------
 
 	// ----- シートを走査 ----------------------
@@ -419,6 +370,58 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	// ---------------------------------------
 
 	return &event, nil
+}
+
+func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
+	var reservations []*Reservation
+
+	// search the cache for each item
+	var eventIDsForSearching []int64
+	for _, eid := range eventIDs {
+		if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)); found {
+			// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
+			log.Printf("Cache HIT eid: %v", eid)
+			reservationsForEventID := x.([]*Reservation)
+			reservations = append(reservations, reservationsForEventID...)
+		} else {
+			// 見つからなければ、検索用IDに追加
+			eventIDsForSearching = append(eventIDsForSearching, eid)
+		}
+	}
+
+	// SELECT query (slow!)
+	if len(eventIDsForSearching) > 0 {
+		sql := fmt.Sprintf("SELECT id, event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (%s) AND canceled_at IS NULL", arrayToString(eventIDsForSearching, ","))
+		reservationsRows, err := db.Query(sql)
+		if err != nil {
+			log.Fatal(err)
+			return nil, err
+		}
+		defer reservationsRows.Close()
+		for reservationsRows.Next() {
+			var reservation Reservation
+			if err := reservationsRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+			reservations = append(reservations, &reservation)
+		}
+
+		// set each item in the cache
+		for _, eid := range eventIDs {
+			r := funk.Filter(reservations, func(x *Reservation) bool {
+				return x.EventID == eid
+			})
+			if r != nil {
+				reservationsForEventID := r.([]*Reservation)
+				goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(eid, 10), reservationsForEventID, cache.DefaultExpiration)
+			}
+		}
+	}
+
+	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
+
+	return reservations, nil
 }
 
 func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
@@ -536,25 +539,6 @@ func main() {
 
 	// go-cache
 	goCache = cache.New(60*time.Minute, 120*time.Minute)
-	{
-		log.Printf("sheets not-hit, so will be cahed")
-		var sheets []Sheet
-		sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer sheetsRows.Close()
-
-		for sheetsRows.Next() {
-			var sheet Sheet
-			if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-				log.Fatal(err)
-			}
-			sheets = append(sheets, sheet)
-		}
-
-		goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
-	}
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -587,12 +571,33 @@ func main() {
 		})
 	}, fillinUser)
 	e.GET("/initialize", func(c echo.Context) error {
+		// db reset
 		cmd := exec.Command("../../db/init.sh")
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		err := cmd.Run()
 		if err != nil {
 			return nil
+		}
+
+		// cache reset
+		goCache.Flush()
+		{
+			var sheets []Sheet
+			sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer sheetsRows.Close()
+
+			for sheetsRows.Next() {
+				var sheet Sheet
+				if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+					log.Fatal(err)
+				}
+				sheets = append(sheets, sheet)
+			}
+			goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
 		}
 
 		return c.NoContent(204)
@@ -889,6 +894,22 @@ func main() {
 				log.Println("re-try: rollback by", err)
 				continue
 			}
+
+			// insert the reservation into cache after commit DB
+			{
+				var reservationsForEventID []*Reservation
+				time := time.Now().UTC()
+				reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time}
+				if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
+					// 見つかったら結果配列に既存要素をぶち込む
+					reservationsForEventID = x.([]*Reservation)
+				} else {
+					// 見つからなければ、何もしない。
+				}
+				reservationsForEventID = append(reservationsForEventID, &reservation)
+				goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
+			}
+
 			if err := tx.Commit(); err != nil {
 				tx.Rollback()
 				log.Println("re-try: rollback by", err)
@@ -896,24 +917,6 @@ func main() {
 			}
 
 			break
-		}
-
-		// insert the reservation into cache after commit DB
-		{
-			// log.Printf("Cache DEL with INSERT eid: %v", event.ID)
-			// goCache.Delete("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10))
-
-			var reservationsForEventID []*Reservation
-			time := time.Now().UTC()
-			reservation := Reservation{EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time}
-			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
-				// 見つかったら結果配列に既存要素をぶち込む
-				reservationsForEventID = x.([]*Reservation)
-			} else {
-				// 見つからなければ、何もしない。
-			}
-			reservationsForEventID = append(reservationsForEventID, &reservation)
-			goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
 		}
 
 		return c.JSON(202, echo.Map{
@@ -977,33 +980,34 @@ func main() {
 
 		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
 			tx.Rollback()
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
+			log.Printf("ROLLBACK UPDATE reservations")
 			return err
 		}
 
 		// update cache after commit DB
 		{
-			log.Printf("Cache UPDATE eid: %v", event.ID)
-			// 手抜き。見つかったらキーをDELETE。本来UPDATEすべき
-			// goCache.Delete("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10))
-
 			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
 				reservationsForEventID := x.([]*Reservation)
-				foundReservation := funk.Find(reservationsForEventID, func(r *Reservation) bool {
-					return r.ID == reservation.ID
-				})
-				if foundReservation != nil {
-					reservation := foundReservation.(*Reservation)
-					now := time.Now().UTC()
-					reservation.ReservedAt = &now
-					reservation.ReservedAtUnix = now.Unix()
+				// find index of the reservation
+				sliceIndex := -1
+				for i := range reservationsForEventID {
+					if reservationsForEventID[i].ID == reservation.ID {
+						sliceIndex = i
+						break
+					}
+				}
+				// remove the element from slice if exists
+				if sliceIndex != -1 {
+					log.Printf("DELETE the cache of index: %v", sliceIndex)
+					reservationsForEventID = append(reservationsForEventID[:sliceIndex], reservationsForEventID[sliceIndex+1:]...)
 					goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
 				}
-
 			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("ERR when commiting UPDATE reservations")
+			return err
 		}
 
 		return c.NoContent(204)
