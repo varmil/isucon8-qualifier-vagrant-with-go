@@ -19,6 +19,7 @@
  * 19292  : WIP ↑引き続き。Cache更新タイミングをトランザクションのcommit後に変更することで若干緩和。/actions/reservations のFOR UPDATEを削除
  * 9k-29k : WIP ↑引き続き。 fetchAndCacheReservations() に順次置き換え
  * 37k    : WIP ↑引き続き。 マニュアルをもう一度読む。/admin/api/reports/sales が原因で負荷レベルが上がらない。ORDER BYせずとも何とPASSした。罠。
+ * TODO: goCache to redis, improve /admin/api/reports/sales using cache ?
  */
 package main
 
@@ -36,6 +37,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	funk "github.com/thoas/go-funk"
@@ -51,6 +53,7 @@ import (
 )
 
 var goCache *cache.Cache
+var mx *sync.Mutex
 
 type User struct {
 	ID        int64  `json:"id,omitempty"`
@@ -382,7 +385,7 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 	for _, eid := range eventIDs {
 		if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)); found {
 			// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-			log.Printf("Cache HIT eid: %v", eid)
+			// log.Printf("Cache HIT eid: %v", eid)
 			reservationsForEventID := x.([]*Reservation)
 			reservations = append(reservations, reservationsForEventID...)
 		} else {
@@ -541,6 +544,9 @@ func main() {
 
 	// go-cache
 	goCache = cache.New(60*time.Minute, 120*time.Minute)
+
+	// mutex
+	mx = new(sync.Mutex)
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -901,7 +907,7 @@ func main() {
 				continue
 			}
 
-			// insert the reservation into cache after commit DB
+			// insert the reservation into cache before commit DB
 			{
 				var reservationsForEventID []*Reservation
 				time := time.Now().UTC()
@@ -988,6 +994,7 @@ func main() {
 
 		if reservation.UserID != user.ID {
 			tx.Rollback()
+			log.Printf("403 (DELETE RESERVATIONS) RUID: %v, sessionUID: %v", reservation.UserID, user.ID)
 			return resError(c, "not_permitted", 403)
 		}
 
@@ -997,8 +1004,9 @@ func main() {
 			return err
 		}
 
-		// update cache after commit DB
+		// update cache before commit DB
 		{
+			// mx.Lock()
 			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
 				reservationsForEventID := x.([]*Reservation)
 				// find index of the reservation
@@ -1016,6 +1024,7 @@ func main() {
 					goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
 				}
 			}
+			// mx.Unlock()
 		}
 
 		if err := tx.Commit(); err != nil {
