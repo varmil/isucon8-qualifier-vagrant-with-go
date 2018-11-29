@@ -858,22 +858,26 @@ func main() {
 		var sheet Sheet
 		var reservationID int64
 		for {
-			log.Printf("FOR LOOOOOOP eid: %v", eventID)
+			// fetch reserved sheetIDs of the event
+			reservations, err := fetchAndCacheReservations([]int64{eventID})
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+			sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
+				return x.SheetID
+			}).([]int64)
+			if len(sheetIDs) == 0 {
+				sheetIDs = append(sheetIDs, 0)
+			}
 
-			// TODO: get from cache
-			// if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
-			// 	reservationsForEventID := x.([]*Reservation)
-			// 	sheetIDs := funk.Map(reservationsForEventID, func(x *Reservation) int64 {
-			// 		return x.SheetID
-			// 	})
-			// } else {
-			// 	// 手抜き。見つからなければ、何もしない。（本来追加すべき？）
-			// }
-
-			if err := db.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL) AND `rank` = ? ORDER BY RAND() LIMIT 1", event.ID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			// fetch a NOT reserved sheet
+			query := fmt.Sprintf("SELECT * FROM sheets WHERE id NOT IN (%s) AND `rank` = '%s' ORDER BY RAND() LIMIT 1", arrayToString(sheetIDs, ","), params.Rank)
+			if err := db.QueryRow(query).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 				if err == sql.ErrNoRows {
 					return resError(c, "sold_out", 409)
 				}
+				log.Fatal(err)
 				return err
 			}
 
@@ -965,14 +969,21 @@ func main() {
 			return err
 		}
 
-		var reservation Reservation
-		if err := tx.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at) FOR UPDATE", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
-			tx.Rollback()
-			if err == sql.ErrNoRows {
-				return resError(c, "not_reserved", 400)
-			}
+		// fetch the first reserved record of the event
+		reservations, err := fetchAndCacheReservations([]int64{event.ID})
+		if err != nil {
+			log.Fatal(err)
 			return err
 		}
+		found := funk.Find(reservations, func(x *Reservation) bool {
+			return x.SheetID == sheet.ID
+		})
+		if found == nil {
+			log.Printf("NOT FOUND (DELETE RESERVATIONS)")
+			return resError(c, "not_reserved", 400)
+		}
+		reservation := *(found.(*Reservation))
+
 		if reservation.UserID != user.ID {
 			tx.Rollback()
 			return resError(c, "not_permitted", 403)
