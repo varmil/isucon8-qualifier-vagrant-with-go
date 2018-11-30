@@ -94,9 +94,9 @@ type Sheet struct {
 
 type Reservation struct {
 	ID         int64      `json:"id"`
-	EventID    int64      `json:"-"`
-	SheetID    int64      `json:"-"`
-	UserID     int64      `json:"-"`
+	EventID    int64      `json:"event_id,omitempty"`
+	SheetID    int64      `json:"sheet_id,omitempty"`
+	UserID     int64      `json:"user_id,omitempty"`
 	ReservedAt *time.Time `json:"-"`
 	CanceledAt *time.Time `json:"-"`
 
@@ -129,6 +129,24 @@ func arrayToString(a []int64, delim string) string {
 	return strings.Trim(strings.Replace(fmt.Sprint(a), " ", delim, -1), "[]")
 	//return strings.Trim(strings.Join(strings.Split(fmt.Sprint(a), " "), delim), "[]")
 	//return strings.Trim(strings.Join(strings.Fields(fmt.Sprint(a)), delim), "[]")
+}
+
+func cacheSheets() {
+	var sheets []Sheet
+	sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sheetsRows.Close()
+
+	for sheetsRows.Next() {
+		var sheet Sheet
+		if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			log.Fatal(err)
+		}
+		sheets = append(sheets, sheet)
+	}
+	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
 }
 
 func sessUserID(c echo.Context) int64 {
@@ -310,7 +328,7 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var reservations []*Reservation
 	{
 		// =========
-		// bfTime := time.Now()
+		bfTime := time.Now()
 		// =========
 
 		var err error
@@ -321,8 +339,8 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		}
 
 		// =========
-		// afTime := time.Now()
-		// log.Printf("##### RRR TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		afTime := time.Now()
+		log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
 		// =========
 	}
 
@@ -375,18 +393,28 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 
 func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 	var reservations []*Reservation
+	var eventIDsForSearching []int64
 
 	// search the cache for each item
-	var eventIDsForSearching []int64
-	for _, eid := range eventIDs {
-		if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)); found {
-			// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-			// log.Printf("Cache HIT eid: %v", eid)
-			reservationsForEventID := x.([]*Reservation)
-			reservations = append(reservations, reservationsForEventID...)
-		} else {
-			// 見つからなければ、検索用IDに追加
-			eventIDsForSearching = append(eventIDsForSearching, eid)
+	{
+		for _, eid := range eventIDs {
+			val, err := redisCli.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)).Bytes()
+			if err != redis.Nil {
+				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
+				deserialized := make([]*Reservation, 0)
+				err = json.Unmarshal(val, &deserialized)
+				if err != nil {
+					log.Fatal(err)
+					return nil, err
+				}
+				if len(deserialized) > 0 {
+					// log.Printf("CHIT: %v", eid)
+					reservations = append(reservations, deserialized...)
+				}
+			} else {
+				// 見つからなければ、検索用IDに追加
+				eventIDsForSearching = append(eventIDsForSearching, eid)
+			}
 		}
 	}
 
@@ -405,22 +433,37 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 				log.Fatal(err)
 				return nil, err
 			}
+			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
 			reservations = append(reservations, &reservation)
 		}
 
 		// set each item in the cache
-		for _, eid := range eventIDs {
-			r := funk.Filter(reservations, func(x *Reservation) bool {
-				return x.EventID == eid
-			})
-			if r != nil {
-				reservationsForEventID := r.([]*Reservation)
-				goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(eid, 10), reservationsForEventID, cache.DefaultExpiration)
+		{
+			pipe := redisCli.TxPipeline()
+			for _, eid := range eventIDsForSearching {
+				r := funk.Filter(reservations, func(x *Reservation) bool {
+					return x.EventID == eid
+				})
+				if r != nil {
+					reservationsForEventID := r.([]*Reservation)
+					bytes, err := json.Marshal(reservationsForEventID)
+					if err != nil {
+						log.Fatal(err)
+						return nil, err
+					}
+					// log.Printf("CNOT HIT: %v, len: %v", eid, len(reservationsForEventID))
+					pipe.Set("reservations.notCanceled.eid."+strconv.FormatInt(eid, 10), bytes, 10*time.Minute)
+				}
+			}
+			_, err = pipe.Exec()
+			if err != nil {
+				log.Fatal(err)
+				return nil, err
 			}
 		}
 	}
 
-	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAt.Before(*reservations[j].ReservedAt) })
+	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
 
 	return reservations, nil
 }
@@ -463,7 +506,7 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 			// シートに予約が入っている場合、最もReservedAtが早いものを取得
 			sheetCopy.Mine = reservation.UserID == loginUserID
 			sheetCopy.Reserved = true
-			sheetCopy.ReservedAtUnix = reservation.ReservedAt.Unix()
+			sheetCopy.ReservedAtUnix = reservation.ReservedAtUnix
 		}
 
 		event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
@@ -544,10 +587,14 @@ func main() {
 	// redis
 	{
 		redisCli = createRedisClient()
+		redisCli.FlushAll()
 	}
 
 	// go-cache
-	goCache = cache.New(60*time.Minute, 120*time.Minute)
+	{
+		goCache = cache.New(60*time.Minute, 120*time.Minute)
+		cacheSheets()
+	}
 
 	// mutex
 	mx = new(sync.Mutex)
@@ -592,24 +639,15 @@ func main() {
 			return nil
 		}
 
-		// cache reset
+		// go-cache reset
 		goCache.Flush()
 		{
-			var sheets []Sheet
-			sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer sheetsRows.Close()
+			cacheSheets()
+		}
 
-			for sheetsRows.Next() {
-				var sheet Sheet
-				if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-					log.Fatal(err)
-				}
-				sheets = append(sheets, sheet)
-			}
-			goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
+		// redis reset
+		{
+			redisCli.FlushAll()
 		}
 
 		return c.NoContent(204)
