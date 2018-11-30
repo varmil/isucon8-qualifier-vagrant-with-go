@@ -20,7 +20,8 @@
  * 19292  : WIP ↑引き続き。Cache更新タイミングをトランザクションのcommit後に変更することで若干緩和。/actions/reservations のFOR UPDATEを削除
  * 9k-29k : WIP ↑引き続き。 fetchAndCacheReservations() に順次置き換え
  * 37k    : WIP ↑引き続き。 マニュアルをもう一度読む。/admin/api/reports/sales が原因で負荷レベルが上がらない。ORDER BYせずとも何とPASSした。罠。
- * TODO: goCache to redis, improve /admin/api/reports/sales using cache ?
+ * refactor goCache --> redis
+ * refactor WATCH（SETNX）を使うか、HASH型にしてATOMICに書き換えできるようにする。
  */
 package main
 
@@ -973,6 +974,7 @@ func main() {
 			}
 
 			// insert the reservation into cache before commit DB
+			// TODO: WATCH the key
 			{
 				var reservationsForEventID []*Reservation
 				time := time.Now().UTC()
@@ -1074,6 +1076,7 @@ func main() {
 		}
 
 		// update cache before commit DB
+		// TODO: WATCH the key
 		{
 			pipe := redisCli.TxPipeline()
 			reservationsForEventID, err := getReservationsFromCache(event.ID)
