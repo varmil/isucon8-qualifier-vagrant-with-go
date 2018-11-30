@@ -2,6 +2,7 @@
  * ## REQUIREMENT
  * go get -u github.com/oxequa/realize
  * go get github.com/joho/godotenv
+ * go get -u github.com/go-redis/redis
  *
  *
  * ## HOW TO SERVE
@@ -48,12 +49,10 @@ import (
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
 
+	"github.com/go-redis/redis"
 	"github.com/joho/godotenv"
 	"github.com/patrickmn/go-cache"
 )
-
-var goCache *cache.Cache
-var mx *sync.Mutex
 
 type User struct {
 	ID        int64  `json:"id,omitempty"`
@@ -114,6 +113,16 @@ type Administrator struct {
 	Nickname  string `json:"nickname,omitempty"`
 	LoginName string `json:"login_name,omitempty"`
 	PassHash  string `json:"pass_hash,omitempty"`
+}
+
+func createRedisClient() *redis.Client {
+	client := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+
+	return client
 }
 
 func arrayToString(a []int64, delim string) string {
@@ -259,19 +268,6 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 		events[i] = addedEvents[i]
 	}
-
-	// for i, v := range events {
-	// 	event, err := getEvent(v.ID, -1)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	for k := range event.Sheets {
-	// 		event.Sheets[k].Detail = nil
-	// 	}
-	// 	events[i] = event
-	// }
-
-	// pp.Print(events)
 
 	afTime := time.Now()
 	log.Printf("[getEvents] for loop with getEvent() TIME: %f", afTime.Sub(bfTime).Seconds())
@@ -517,6 +513,9 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 }
 
 var db *sql.DB
+var goCache *cache.Cache
+var mx *sync.Mutex
+var redisCli *redis.Client
 
 func main() {
 	var err error
@@ -540,6 +539,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+	}
+
+	// redis
+	{
+		redisCli = createRedisClient()
 	}
 
 	// go-cache
