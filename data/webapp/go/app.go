@@ -391,6 +391,40 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	return &event, nil
 }
 
+/**
+ * Redisサーバに問い合わせる。結果がなければempty slice
+ * TODO: use pipe
+ */
+func getReservationsFromCache(eventID int64) ([]*Reservation, error) {
+	var reservations []*Reservation
+
+	val, err := redisCli.Get("reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)).Bytes()
+	if err != redis.Nil {
+		deserialized := make([]*Reservation, 0)
+		err = json.Unmarshal(val, &deserialized)
+		if err != nil {
+			return nil, err
+		}
+		if len(deserialized) > 0 {
+			reservations = append(reservations, deserialized...)
+		}
+	}
+	return reservations, nil
+}
+
+/**
+ * Redisサーバに保存
+ */
+func setToCache(eventID int64, reservations []*Reservation, set func(key string, value interface{}, expiration time.Duration) *redis.StatusCmd) error {
+	bytes, err := json.Marshal(reservations)
+	if err != nil {
+		return err
+	}
+	// log.Printf("CNOT HIT: %v, len: %v", eid, len(reservations))
+	set("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), bytes, 10*time.Minute)
+	return nil
+}
+
 func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 	var reservations []*Reservation
 	var eventIDsForSearching []int64
@@ -398,19 +432,14 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 	// search the cache for each item
 	{
 		for _, eid := range eventIDs {
-			val, err := redisCli.Get("reservations.notCanceled.eid." + strconv.FormatInt(eid, 10)).Bytes()
-			if err != redis.Nil {
+			deserialized, err := getReservationsFromCache(eid)
+			if err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+			if len(deserialized) > 0 {
 				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-				deserialized := make([]*Reservation, 0)
-				err = json.Unmarshal(val, &deserialized)
-				if err != nil {
-					log.Fatal(err)
-					return nil, err
-				}
-				if len(deserialized) > 0 {
-					// log.Printf("CHIT: %v", eid)
-					reservations = append(reservations, deserialized...)
-				}
+				reservations = append(reservations, deserialized...)
 			} else {
 				// 見つからなければ、検索用IDに追加
 				eventIDsForSearching = append(eventIDsForSearching, eid)
@@ -446,13 +475,7 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 				})
 				if r != nil {
 					reservationsForEventID := r.([]*Reservation)
-					bytes, err := json.Marshal(reservationsForEventID)
-					if err != nil {
-						log.Fatal(err)
-						return nil, err
-					}
-					// log.Printf("CNOT HIT: %v, len: %v", eid, len(reservationsForEventID))
-					pipe.Set("reservations.notCanceled.eid."+strconv.FormatInt(eid, 10), bytes, 10*time.Minute)
+					setToCache(eid, reservationsForEventID, pipe.Set)
 				}
 			}
 			_, err = pipe.Exec()
@@ -953,15 +976,19 @@ func main() {
 			{
 				var reservationsForEventID []*Reservation
 				time := time.Now().UTC()
-				reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time}
-				if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
+				reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
+
+				deserialized, err := getReservationsFromCache(event.ID)
+				if err != nil {
+					log.Fatal(err)
+					return err
+				}
+				if len(deserialized) > 0 {
 					// 見つかったら結果配列に既存要素をぶち込む
-					reservationsForEventID = x.([]*Reservation)
-				} else {
-					// 見つからなければ、何もしない。
+					reservationsForEventID = deserialized
 				}
 				reservationsForEventID = append(reservationsForEventID, &reservation)
-				goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
+				setToCache(event.ID, reservationsForEventID, redisCli.Set)
 			}
 
 			if err := tx.Commit(); err != nil {
@@ -1048,10 +1075,14 @@ func main() {
 
 		// update cache before commit DB
 		{
-			// mx.Lock()
-			if x, found := goCache.Get("reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)); found {
-				reservationsForEventID := x.([]*Reservation)
-				// find index of the reservation
+			pipe := redisCli.TxPipeline()
+			reservationsForEventID, err := getReservationsFromCache(event.ID)
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+			if len(reservationsForEventID) > 0 {
+				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
 				sliceIndex := -1
 				for i := range reservationsForEventID {
 					if reservationsForEventID[i].ID == reservation.ID {
@@ -1063,10 +1094,14 @@ func main() {
 				if sliceIndex != -1 {
 					log.Printf("DELETE the cache of index: %v", sliceIndex)
 					reservationsForEventID = append(reservationsForEventID[:sliceIndex], reservationsForEventID[sliceIndex+1:]...)
-					goCache.Set("reservations.notCanceled.eid."+strconv.FormatInt(event.ID, 10), reservationsForEventID, cache.DefaultExpiration)
+					setToCache(event.ID, reservationsForEventID, pipe.Set)
 				}
 			}
-			// mx.Unlock()
+			_, err = pipe.Exec()
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
 		}
 
 		if err := tx.Commit(); err != nil {
