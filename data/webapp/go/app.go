@@ -2,6 +2,7 @@
  * ## REQUIREMENT
  * go get -u github.com/oxequa/realize
  * go get github.com/joho/godotenv
+ * go get github.com/patrickmn/go-cache
  * go get -u github.com/go-redis/redis
  *
  *
