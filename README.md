@@ -27,6 +27,7 @@ bin/bench -remotes=127.0.0.1 -output result.json
 sudo -i -u isucon
 go get -u github.com/oxequa/realize
 go get -u github.com/joho/godotenv
+go get github.com/thoas/go-funk
 go get github.com/patrickmn/go-cache
 go get -u github.com/go-redis/redis
 ```
