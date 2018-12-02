@@ -581,66 +581,6 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 		}
 	}
 
-	// COMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
-	// err := redisCli.Watch(func(tx *redis.Tx) error {
-	// 	// fetch reserved sheetIDs of the event
-	// 	pipe := tx.TxPipeline()
-	// 	reservations, err := fetchAndCacheReservations([]int64{event.ID}, nil)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
-	// 		return x.SheetID
-	// 	}).([]int64)
-	// 	if len(sheetIDs) == 0 {
-	// 		sheetIDs = append(sheetIDs, 0)
-	// 	}
-
-	// 	// fetch a NOT reserved sheet
-	// 	query := fmt.Sprintf("SELECT * FROM sheets WHERE id NOT IN (%s) AND `rank` = '%s' ORDER BY RAND() LIMIT 1", arrayToString(sheetIDs, ","), rank)
-	// 	if err := db.QueryRow(query).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-	// 		if err == sql.ErrNoRows {
-	// 			return sql.ErrNoRows
-	// 		}
-	// 		return err
-	// 	}
-
-	// 	dbtx, err := db.Begin()
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	res, err := dbtx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
-	// 	if err != nil {
-	// 		dbtx.Rollback()
-	// 		return err
-	// 	}
-	// 	reservationID, err = res.LastInsertId()
-	// 	if err != nil {
-	// 		dbtx.Rollback()
-	// 		return err
-	// 	}
-
-	// 	// insert the reservation into cache before commit DB
-	// 	{
-	// 		time := time.Now().UTC()
-	// 		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-	// 		hset(event.ID, reservationID, &reservation, pipe)
-
-	// 		_, err = pipe.Exec()
-	// 		if err != nil {
-	// 			dbtx.Rollback()
-	// 			return err
-	// 		}
-	// 	}
-
-	// 	if err := dbtx.Commit(); err != nil {
-	// 		dbtx.Rollback()
-	// 		return err
-	// 	}
-
-	// 	return err
-	// }, key)
-
 	return reservationID, sheet, err
 }
 
