@@ -42,9 +42,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/patrickmn/go-cache"
-	funk "github.com/thoas/go-funk"
-
 	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
@@ -52,6 +49,10 @@ import (
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
+	"github.com/patrickmn/go-cache"
+	funk "github.com/thoas/go-funk"
+
+	sess "torb/session"
 )
 
 type User struct {
@@ -149,68 +150,6 @@ func cacheSheets() {
 	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
 }
 
-func sessUserID(c echo.Context) int64 {
-	sess, _ := session.Get("session", c)
-	var userID int64
-	if x, ok := sess.Values["user_id"]; ok {
-		userID, _ = x.(int64)
-	}
-	return userID
-}
-
-func sessSetUserID(c echo.Context, id int64) {
-	sess, _ := session.Get("session", c)
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   3600,
-		HttpOnly: true,
-	}
-	sess.Values["user_id"] = id
-	sess.Save(c.Request(), c.Response())
-}
-
-func sessDeleteUserID(c echo.Context) {
-	sess, _ := session.Get("session", c)
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   3600,
-		HttpOnly: true,
-	}
-	delete(sess.Values, "user_id")
-	sess.Save(c.Request(), c.Response())
-}
-
-func sessAdministratorID(c echo.Context) int64 {
-	sess, _ := session.Get("session", c)
-	var administratorID int64
-	if x, ok := sess.Values["administrator_id"]; ok {
-		administratorID, _ = x.(int64)
-	}
-	return administratorID
-}
-
-func sessSetAdministratorID(c echo.Context, id int64) {
-	sess, _ := session.Get("session", c)
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   3600,
-		HttpOnly: true,
-	}
-	sess.Values["administrator_id"] = id
-	sess.Save(c.Request(), c.Response())
-}
-
-func sessDeleteAdministratorID(c echo.Context) {
-	sess, _ := session.Get("session", c)
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   3600,
-		HttpOnly: true,
-	}
-	delete(sess.Values, "administrator_id")
-	sess.Save(c.Request(), c.Response())
-}
-
 func loginRequired(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		if _, err := getLoginUser(c); err != nil {
@@ -230,7 +169,7 @@ func adminLoginRequired(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func getLoginUser(c echo.Context) (*User, error) {
-	userID := sessUserID(c)
+	userID := sess.SessUserID(c)
 	if userID == 0 {
 		return nil, errors.New("not logged in")
 	}
@@ -240,7 +179,7 @@ func getLoginUser(c echo.Context) (*User, error) {
 }
 
 func getLoginAdministrator(c echo.Context) (*Administrator, error) {
-	administratorID := sessAdministratorID(c)
+	administratorID := sess.SessAdministratorID(c)
 	if administratorID == 0 {
 		return nil, errors.New("not logged in")
 	}
@@ -856,7 +795,7 @@ func main() {
 			return resError(c, "authentication_failed", 401)
 		}
 
-		sessSetUserID(c, user.ID)
+		sess.SessSetUserID(c, user.ID)
 		user, err = getLoginUser(c)
 		if err != nil {
 			return err
@@ -864,7 +803,7 @@ func main() {
 		return c.JSON(200, user)
 	})
 	e.POST("/api/actions/logout", func(c echo.Context) error {
-		sessDeleteUserID(c)
+		sess.SessDeleteUserID(c)
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/api/events", func(c echo.Context) error {
@@ -1151,7 +1090,7 @@ func main() {
 			return resError(c, "authentication_failed", 401)
 		}
 
-		sessSetAdministratorID(c, administrator.ID)
+		sess.SessSetAdministratorID(c, administrator.ID)
 		administrator, err = getLoginAdministrator(c)
 		if err != nil {
 			return err
@@ -1159,7 +1098,7 @@ func main() {
 		return c.JSON(200, administrator)
 	})
 	e.POST("/admin/api/actions/logout", func(c echo.Context) error {
-		sessDeleteAdministratorID(c)
+		sess.SessDeleteAdministratorID(c)
 		return c.NoContent(204)
 	}, adminLoginRequired)
 	e.GET("/admin/api/events", func(c echo.Context) error {
