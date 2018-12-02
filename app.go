@@ -216,7 +216,7 @@ func getEvents(all bool) ([]*Event, error) {
 		events = append(events, &event)
 	}
 
-	bfTime := time.Now()
+	// bfTime := time.Now()
 
 	ids := funk.Map(events, func(x *Event) int64 {
 		return x.ID
@@ -229,8 +229,8 @@ func getEvents(all bool) ([]*Event, error) {
 		events[i] = addedEvents[i]
 	}
 
-	afTime := time.Now()
-	log.Printf("[getEvents] for loop with getEvent() TIME: %f", afTime.Sub(bfTime).Seconds())
+	// afTime := time.Now()
+	// log.Printf("[getEvents] for loop with getEvent() TIME: %f", afTime.Sub(bfTime).Seconds())
 
 	return events, nil
 }
@@ -386,12 +386,17 @@ func setToCache(eventID int64, reservations []*Reservation, hmset func(key strin
 /**
  * HSET
  */
-func hset(eventID int64, reservationID int64, reservation *Reservation) error {
+func hset(eventID int64, reservationID int64, reservation *Reservation, pipe redis.Pipeliner) error {
+	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
+	if pipe == nil {
+		panic("PIPE IS NIL")
+	}
+
 	bytes, err := json.Marshal(reservation)
 	if err != nil {
 		panic("MAP ERROR")
 	}
-	redisCli.HSet("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10), bytes)
+	pipe.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
 	return nil
 }
 
@@ -561,7 +566,7 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 		{
 			time := time.Now().UTC()
 			reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-			hset(event.ID, reservationID, &reservation)
+			hset(event.ID, reservationID, &reservation, pipe)
 
 			_, err = pipe.Exec()
 			if err != nil {
