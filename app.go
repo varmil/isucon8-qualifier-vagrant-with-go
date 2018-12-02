@@ -274,7 +274,7 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		// =========
 
 		var err error
-		reservations, err = fetchAndCacheReservations(eventIDs)
+		reservations, err = fetchAndCacheReservations(eventIDs, nil)
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
@@ -314,7 +314,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var reservations []*Reservation
 	var err error
 	{
-		reservations, err = fetchAndCacheReservations([]int64{eventID})
+		reservations, err = fetchAndCacheReservations([]int64{eventID}, nil)
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
@@ -336,12 +336,19 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 /**
  * HGetAll。結果がなければempty slice
  */
-func getReservationsFromCache(eventID int64) ([]*Reservation, error) {
+func getReservationsFromCache(eventID int64, pipe redis.Pipeliner) ([]*Reservation, error) {
 	var reservations []*Reservation
+	var val map[string]string
+	var err error
 
-	val, err := redisCli.HGetAll("reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)).Result()
+	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
+	if pipe == nil {
+		val, err = redisCli.HGetAll(key).Result()
+	} else {
+		val, err = pipe.HGetAll(key).Result()
+	}
+
 	if err != redis.Nil {
-
 		for _, reservationStr := range funk.Values(val).([]string) {
 			var deserialized *Reservation
 			err = json.Unmarshal([]byte(reservationStr), &deserialized)
@@ -396,14 +403,15 @@ func hdel(eventID int64, reservationID int64) error {
 	return nil
 }
 
-func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
+func fetchAndCacheReservations(eventIDs []int64, pipe redis.Pipeliner) ([]*Reservation, error) {
 	var reservations []*Reservation
 	var eventIDsForSearching []int64
 
 	// search the cache for each item
+	// TODO: 見つからない場合 == キャッシュがない or 予約ゼロ。後者の場合を区別する
 	{
 		for _, eid := range eventIDs {
-			deserialized, err := getReservationsFromCache(eid)
+			deserialized, err := getReservationsFromCache(eid, pipe)
 			if err != nil {
 				log.Fatal(err)
 				return nil, err
@@ -417,8 +425,6 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 			}
 		}
 	}
-
-	// TODO: 見つからない場合に検索しない
 
 	// SELECT query (slow!)
 	if len(eventIDsForSearching) > 0 {
@@ -441,7 +447,6 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 
 		// set each item in the cache
 		{
-			// pipe := redisCli.TxPipeline()
 			for _, eid := range eventIDsForSearching {
 				r := funk.Filter(reservations, func(x *Reservation) bool {
 					return x.EventID == eid
@@ -451,11 +456,6 @@ func fetchAndCacheReservations(eventIDs []int64) ([]*Reservation, error) {
 					setToCache(eid, reservationsForEventID, redisCli.HMSet)
 				}
 			}
-			// _, err = pipe.Exec()
-			// if err != nil {
-			// 	log.Fatal(err)
-			// 	return nil, err
-			// }
 		}
 	}
 
@@ -509,6 +509,76 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 	}
 
 	return nil
+}
+
+/**
+ * INSERT INTO reservations
+ */
+func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, error) {
+	var reservationID int64
+	var sheet Sheet
+	key := "reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)
+
+	err := redisCli.Watch(func(tx *redis.Tx) error {
+		// fetch reserved sheetIDs of the event
+		pipe := tx.TxPipeline()
+		reservations, err := fetchAndCacheReservations([]int64{event.ID}, nil)
+		if err != nil {
+			return err
+		}
+		sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
+			return x.SheetID
+		}).([]int64)
+		if len(sheetIDs) == 0 {
+			sheetIDs = append(sheetIDs, 0)
+		}
+
+		// fetch a NOT reserved sheet
+		query := fmt.Sprintf("SELECT * FROM sheets WHERE id NOT IN (%s) AND `rank` = '%s' ORDER BY RAND() LIMIT 1", arrayToString(sheetIDs, ","), rank)
+		if err := db.QueryRow(query).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			if err == sql.ErrNoRows {
+				return sql.ErrNoRows
+			}
+			return err
+		}
+
+		dbtx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		res, err := dbtx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+		if err != nil {
+			dbtx.Rollback()
+			return err
+		}
+		reservationID, err = res.LastInsertId()
+		if err != nil {
+			dbtx.Rollback()
+			return err
+		}
+
+		// insert the reservation into cache before commit DB
+		{
+			time := time.Now().UTC()
+			reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
+			hset(event.ID, reservationID, &reservation)
+
+			_, err = pipe.Exec()
+			if err != nil {
+				dbtx.Rollback()
+				return err
+			}
+		}
+
+		if err := dbtx.Commit(); err != nil {
+			dbtx.Rollback()
+			return err
+		}
+
+		return err
+	}, key)
+
+	return reservationID, sheet, err
 }
 
 func sanitizeEvent(e *Event) *Event {
@@ -902,82 +972,24 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		var sheet Sheet
 		var reservationID int64
+		var sheet Sheet
 		for {
-			// fetch reserved sheetIDs of the event
-			reservations, err := fetchAndCacheReservations([]int64{eventID})
-			if err != nil {
-				log.Fatal(err)
-				return err
-			}
-			sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
-				return x.SheetID
-			}).([]int64)
-			if len(sheetIDs) == 0 {
-				sheetIDs = append(sheetIDs, 0)
-			}
-
-			// fetch a NOT reserved sheet
-			query := fmt.Sprintf("SELECT * FROM sheets WHERE id NOT IN (%s) AND `rank` = '%s' ORDER BY RAND() LIMIT 1", arrayToString(sheetIDs, ","), params.Rank)
-			if err := db.QueryRow(query).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-				if err == sql.ErrNoRows {
-					return resError(c, "sold_out", 409)
-				}
-				log.Fatal(err)
-				return err
-			}
-
-			tx, err := db.Begin()
-			if err != nil {
-				return err
-			}
-
-			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
+			reservationID, sheet, err = tryInsertReservation(*user, *event, params.Rank)
+			if err == sql.ErrNoRows {
+				// レスポンスを返すエラー
+				return resError(c, "sold_out", 409)
+			} else if err == redis.TxFailedErr {
+				// WATCH のエラー
 				continue
-			}
-			reservationID, err = res.LastInsertId()
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
+			} else if err != nil {
+				// その他
+				log.Printf("##### INSERT ERROR ##### %v", err)
 				continue
+			} else {
+				// 正常
+				break
 			}
-
-			// insert the reservation into cache before commit DB
-			{
-				time := time.Now().UTC()
-				reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-				hset(event.ID, reservationID, &reservation)
-			}
-
-			// {
-			// 	var reservationsForEventID []*Reservation
-			// 	time := time.Now().UTC()
-			// 	reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-
-			// 	deserialized, err := getReservationsFromCache(event.ID)
-			// 	if err != nil {
-			// 		log.Fatal(err)
-			// 		return err
-			// 	}
-			// 	if len(deserialized) > 0 {
-			// 		// 見つかったら結果配列に既存要素をぶち込む
-			// 		reservationsForEventID = deserialized
-			// 	}
-			// 	reservationsForEventID = append(reservationsForEventID, &reservation)
-			// 	setToCache(event.ID, reservationsForEventID, redisCli.HMSet)
-			// }
-
-			if err := tx.Commit(); err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-
-			break
 		}
 
 		return c.JSON(202, echo.Map{
@@ -1021,77 +1033,60 @@ func main() {
 			return err
 		}
 
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-
-		// fetch the first reserved record of the event
-		reservations, err := fetchAndCacheReservations([]int64{event.ID})
-		if err != nil {
-			log.Fatal(err)
-			return err
-		}
-		found := funk.Find(reservations, func(x *Reservation) bool {
-			return x.SheetID == sheet.ID
-		})
-		if found == nil {
-			log.Printf("NOT FOUND (DELETE RESERVATIONS)")
-			return resError(c, "not_reserved", 400)
-		}
-		reservation := *(found.(*Reservation))
-
-		if reservation.UserID != user.ID {
-			tx.Rollback()
-			log.Printf("403 (DELETE RESERVATIONS) RUID: %v, sessionUID: %v", reservation.UserID, user.ID)
-			return resError(c, "not_permitted", 403)
-		}
-
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
-			tx.Rollback()
-			log.Printf("ROLLBACK UPDATE reservations")
-			return err
-		}
-
-		// update cache before commit DB
-		{
-			hdel(event.ID, reservation.ID)
-		}
-
-		// {
-		// 	pipe := redisCli.TxPipeline()
-		// 	reservationsForEventID, err := getReservationsFromCache(event.ID)
-		// 	if err != nil {
-		// 		log.Fatal(err)
-		// 		return err
-		// 	}
-		// 	if len(reservationsForEventID) > 0 {
-		// 		// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-		// 		sliceIndex := -1
-		// 		for i := range reservationsForEventID {
-		// 			if reservationsForEventID[i].ID == reservation.ID {
-		// 				sliceIndex = i
-		// 				break
-		// 			}
-		// 		}
-		// 		// remove the element from slice if exists
-		// 		if sliceIndex != -1 {
-		// 			log.Printf("DELETE the cache of index: %v", sliceIndex)
-		// 			reservationsForEventID = append(reservationsForEventID[:sliceIndex], reservationsForEventID[sliceIndex+1:]...)
-		// 			setToCache(event.ID, reservationsForEventID, pipe.HMSet)
-		// 		}
-		// 	}
-		// 	_, err = pipe.Exec()
-		// 	if err != nil {
-		// 		log.Fatal(err)
-		// 		return err
-		// 	}
+		// tx, err := db.Begin()
+		// if err != nil {
+		// 	return err
 		// }
 
-		if err := tx.Commit(); err != nil {
-			log.Printf("ERR when commiting UPDATE reservations")
+		// WATCH
+		key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
+		err = redisCli.Watch(func(tx *redis.Tx) error {
+			pipe := tx.TxPipeline()
+
+			// fetch the first reserved record of the event
+			reservations, err := fetchAndCacheReservations([]int64{event.ID}, pipe)
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+			found := funk.Find(reservations, func(x *Reservation) bool {
+				return x.SheetID == sheet.ID
+			})
+			if found == nil {
+				log.Printf("NOT FOUND (DELETE RESERVATIONS)")
+				return resError(c, "not_reserved", 400)
+			}
+			reservation := *(found.(*Reservation))
+
+			if reservation.UserID != user.ID {
+				// tx.Rollback()
+				log.Printf("403 (DELETE RESERVATIONS) RUID: %v, sessionUID: %v", reservation.UserID, user.ID)
+				return resError(c, "not_permitted", 403)
+			}
+
+			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+				// tx.Rollback()
+				log.Printf("ROLLBACK UPDATE reservations")
+				return err
+			}
+
+			// update cache before commit DB
+			{
+				hdel(event.ID, reservation.ID)
+			}
+
+			_, err = pipe.Exec()
+			if err != nil {
+				return err
+			}
+
 			return err
-		}
+		}, key)
+
+		// if err := tx.Commit(); err != nil {
+		// 	log.Printf("ERR when commiting UPDATE reservations")
+		// 	return err
+		// }
 
 		return c.NoContent(204)
 	}, loginRequired)
