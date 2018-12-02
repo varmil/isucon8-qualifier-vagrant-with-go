@@ -5,6 +5,7 @@
  * go get github.com/thoas/go-funk
  * go get github.com/patrickmn/go-cache
  * go get -u github.com/go-redis/redis
+ * go get github.com/json-iterator/go
  *
  *
  * ## HOW TO SERVE
@@ -30,7 +31,6 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -48,6 +48,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
+	"github.com/json-iterator/go"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
@@ -542,6 +543,7 @@ var db *sql.DB
 var goCache *cache.Cache
 var mx *sync.Mutex
 var redisCli *redis.Client
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 func main() {
 	var err error
