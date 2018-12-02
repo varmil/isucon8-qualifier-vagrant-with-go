@@ -42,17 +42,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/patrickmn/go-cache"
 	funk "github.com/thoas/go-funk"
 
+	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
+	"github.com/joho/godotenv"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
-
-	"github.com/go-redis/redis"
-	"github.com/joho/godotenv"
-	"github.com/patrickmn/go-cache"
 )
 
 type User struct {
