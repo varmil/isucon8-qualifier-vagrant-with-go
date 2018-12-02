@@ -25,6 +25,9 @@
  * 37k    : WIP ↑引き続き。 マニュアルをもう一度読む。/admin/api/reports/sales が原因で負荷レベルが上がらない。ORDER BYせずとも何とPASSした。罠。
  * refactor goCache --> redis
  * refactor WATCH（SETNX）を使うか、HASH型にしてATOMICに書き換えできるようにする。
+ * 25k    : INSERT時にSETNXでLockを入れる。SheetsCache利用。早めにLock解除。まだ不安定
+ * 18k    : 更に速く正確にLOCK解除するためにINSERT時にReservationIDを手動で採番する。
+ *
  */
 package main
 
@@ -42,6 +45,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis"
@@ -386,17 +390,13 @@ func setToCache(eventID int64, reservations []*Reservation, hmset func(key strin
 /**
  * HSET
  */
-func hset(eventID int64, reservationID int64, reservation *Reservation, pipe redis.Pipeliner) error {
+func hset(eventID int64, reservationID int64, reservation *Reservation) error {
 	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-	if pipe == nil {
-		panic("PIPE IS NIL")
-	}
-
 	bytes, err := json.Marshal(reservation)
 	if err != nil {
 		panic("MAP ERROR")
 	}
-	pipe.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
+	redisCli.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
 	return nil
 }
 
@@ -519,7 +519,7 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 /**
  * INSERT INTO reservations
  */
-func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, error) {
+func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
 	var reservationID int64
 	var sheet Sheet
 	key := "reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)
@@ -528,9 +528,8 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 	lockKey := "isLocked." + rank + key
 	acquire, err := redisCli.SetNX(lockKey, true, 3*time.Second).Result()
 	if acquire == false {
-		return 0, Sheet{}, errors.New("cant acquire lock")
+		return 0, Sheet{}, ErrCantAcquireLock
 	}
-	defer redisCli.Del(lockKey)
 
 	// 空席を探すために、予約済みの座席を検索する
 	// fetch reserved sheetIDs of the event
@@ -550,6 +549,7 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 		}).([]Sheet)
 
 		if len(EmptrySheets) == 0 {
+			redisCli.Del(lockKey)
 			return 0, Sheet{}, sql.ErrNoRows
 		}
 
@@ -560,25 +560,20 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 		sheet = EmptrySheets[randomInt]
 	}
 
-	res, err := db.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
-	// if err != nil {
-	// 	return err
-	// }
-	reservationID, err = res.LastInsertId()
-	// if err != nil {
-	// 	return err
-	// }
-
-	// insert the reservation into cache before commit DB
+	// 早くLOCK解除するためにreservationIDを手動で採番してCacheぶち込み
+	atomic.AddInt64(&reservationUUID, 1)
+	reservationID = atomic.LoadInt64(&reservationUUID)
+	time := time.Now().UTC()
 	{
-		pipe := redisCli.TxPipeline()
-		time := time.Now().UTC()
 		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-		hset(event.ID, reservationID, &reservation, pipe)
-		_, err = pipe.Exec()
-		if err != nil {
-			return 0, Sheet{}, err
-		}
+		hset(event.ID, reservationID, &reservation)
+		redisCli.Del(lockKey)
+	}
+
+	_, err = db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, time.Format("2006-01-02 15:04:05.000000"))
+	if err != nil {
+		redisCli.Del(lockKey)
+		return 0, Sheet{}, err
 	}
 
 	return reservationID, sheet, err
@@ -629,6 +624,9 @@ var goCache *cache.Cache
 var mx *sync.Mutex
 var redisCli *redis.Client
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+var reservationUUID int64 = 10000000
+var ErrCantAcquireLock = errors.New("cant acquire lock")
 
 func main() {
 	var err error
@@ -978,8 +976,11 @@ func main() {
 		var reservationID int64
 		var sheet Sheet
 		for {
-			reservationID, sheet, err = tryInsertReservation(*user, *event, params.Rank)
-			if err == sql.ErrNoRows {
+			reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
+			if err == ErrCantAcquireLock {
+				// ロック待ち
+				continue
+			} else if err == sql.ErrNoRows {
 				// レスポンスを返すエラー
 				return resError(c, "sold_out", 409)
 			} else if err == redis.TxFailedErr {
@@ -987,8 +988,8 @@ func main() {
 				continue
 			} else if err != nil {
 				// その他
-				// log.Printf("##### LOCK ERROR ##### %v", err)
-				continue
+				log.Printf("##### OTHER ERROR ##### %v", err)
+				break
 			} else {
 				// 正常
 				break
@@ -1285,6 +1286,7 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 
+	// TODO: tuning
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
 		// ORDER BY すると、巨大な一時テーブル作るのでクソ遅い。しなくても、チェック通る、罠
 		rows, err := db.Query("select r.id, r.user_id, r.reserved_at, r.canceled_at, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
