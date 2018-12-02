@@ -525,13 +525,14 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 	key := "reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)
 
 	// LOCK with SETNX
-	lockKey := "isLocked.rank." + rank + key
+	lockKey := "isLocked." + rank + key
 	acquire, err := redisCli.SetNX(lockKey, true, 3*time.Second).Result()
 	if acquire == false {
 		return 0, Sheet{}, errors.New("cant acquire lock")
 	}
 	defer redisCli.Del(lockKey)
 
+	// 空席を探すために、予約済みの座席を検索する
 	// fetch reserved sheetIDs of the event
 	reservations, err := fetchAndCacheReservations([]int64{event.ID}, nil)
 	sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
@@ -541,13 +542,22 @@ func tryInsertReservation(user User, event Event, rank string) (int64, Sheet, er
 		sheetIDs = append(sheetIDs, 0)
 	}
 
+	// 空席を探す
 	// fetch a NOT reserved sheet
-	query := fmt.Sprintf("SELECT * FROM sheets WHERE id NOT IN (%s) AND `rank` = '%s' ORDER BY RAND() LIMIT 1", arrayToString(sheetIDs, ","), rank)
-	if err := db.QueryRow(query).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-		if err == sql.ErrNoRows {
+	if x, found := goCache.Get("sheetsSlice"); found {
+		EmptrySheets := funk.Filter(x.([]Sheet), func(x Sheet) bool {
+			return x.Rank == rank && !funk.ContainsInt64(sheetIDs, x.ID)
+		}).([]Sheet)
+
+		if len(EmptrySheets) == 0 {
 			return 0, Sheet{}, sql.ErrNoRows
 		}
-		return 0, Sheet{}, err
+
+		var randomInt int
+		if len(EmptrySheets) > 1 {
+			randomInt = funk.RandomInt(0, len(EmptrySheets)-1)
+		}
+		sheet = EmptrySheets[randomInt]
 	}
 
 	res, err := db.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
@@ -1037,7 +1047,7 @@ func main() {
 				continue
 			} else if err != nil {
 				// その他
-				log.Printf("##### LOCK ERROR ##### %v", err)
+				// log.Printf("##### LOCK ERROR ##### %v", err)
 				continue
 			} else {
 				// 正常
