@@ -2,6 +2,8 @@
  * ## REQUIREMENT
  * go get -u github.com/oxequa/realize
  * go get github.com/joho/godotenv
+ * go get github.com/thoas/go-funk
+ * go get github.com/patrickmn/go-cache
  * go get -u github.com/go-redis/redis
  *
  *
@@ -13,7 +15,7 @@
  *
  * ### SCORE LOG
  *   800  : SELECT FOR UPDATE が無駄に見えたので削除。
- *  4810  : getEvent() の reservations テーブルSELECTに関して N+1を解決。
+ *  4810  : getEvent() の reservations テーブルSELECTに関して N+1を解決。reservations.user_id に INDEX追加
  *  7700  : go-cacheを用いてsheetsをslice格納してキャッシュ。この時点でgetEvent()はもはやボトルネックではないが、まだ /api/events/:id/actions/reserve 自体は遅い。
  *  9510  : getEvents()が内部で大量にgetEvent()をcallしていたので、呼出回数を実質１回にした。 /api/users/:id が次のボトルネックっぽい。
  * 26078  : WIP getEventsInをcacheしたがrace conditionで弾かれるので、ロックを入れないと駄目かも
