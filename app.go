@@ -28,7 +28,8 @@
  * 25k    : INSERT時にSETNXでLockを入れる。SheetsCache利用。早めにLock解除。まだ不安定
  * 18k    : 更に速く正確にLOCK解除するためにINSERT時にReservationIDを手動で採番する。
  * 45k    : Vagrantfileをいじって、本番スペックに近づけた。UPDATE時のWATCH排除。まだ不安定。
- * 55k    : /admin/api/reports/sales で go func を利用。rows.Scan がまだ遅い？
+ * 30-55k : /admin/api/reports/sales で go func を利用。rows.Scan がまだ遅い？
+ * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い
  *
  */
 package main
@@ -372,6 +373,31 @@ func getReservationsFromCache(eventID int64, pipe redis.Pipeliner) ([]*Reservati
 }
 
 /**
+ * SMEMBERS。結果がなければempty slice
+ */
+func getCanceledReservationsFromCache() ([]*Reservation, error) {
+	var reservations []*Reservation
+
+	key := "reservations.canceled"
+	val, err := redisCli.SMembers(key).Result()
+
+	if err != redis.Nil {
+		for _, reservationStr := range val {
+			var deserialized *Reservation
+			err = json.Unmarshal([]byte(reservationStr), &deserialized)
+			if err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+			if deserialized.ID != 0 {
+				reservations = append(reservations, deserialized)
+			}
+		}
+	}
+	return reservations, nil
+}
+
+/**
  * HMSET (cause error when use pipe.HMSet)
  */
 func setToCache(eventID int64, reservations []*Reservation, hmset func(key string, fields map[string]interface{}) *redis.StatusCmd) error {
@@ -391,6 +417,27 @@ func setToCache(eventID int64, reservations []*Reservation, hmset func(key strin
 
 	// log.Printf("HMSET: %v, len: %v", eventID, len(reservations))
 	hmset("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), reservationsMap)
+	return nil
+}
+
+/**
+ * SADD （REPORT用のキャッシュ）
+ */
+func saddCanceledReservations(reservations []Reservation) error {
+	if len(reservations) == 0 {
+		return nil
+	}
+
+	var result []interface{}
+	for _, reservation := range reservations {
+		bytes, err := json.Marshal(reservation)
+		if err != nil {
+			panic("MAP ERROR")
+		}
+		result = append(result, bytes)
+	}
+
+	redisCli.SAdd("reservations.canceled", result...)
 	return nil
 }
 
@@ -723,6 +770,27 @@ func main() {
 		// redis reset
 		{
 			redisCli.FlushAll()
+
+			// cache canceled reservations
+			{
+				rows, err := db.Query("select id, event_id, user_id, sheet_id, reserved_at, canceled_at from reservations where canceled_at is not null")
+				if err != nil {
+					return err
+				}
+				defer rows.Close()
+
+				var reservations []Reservation
+				for rows.Next() {
+					var reservation Reservation
+					if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.UserID, &reservation.SheetID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+						return err
+					}
+					reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
+					reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
+					reservations = append(reservations, reservation)
+				}
+				saddCanceledReservations(reservations)
+			}
 		}
 
 		return c.NoContent(204)
@@ -1079,14 +1147,20 @@ func main() {
 				return resError(c, "not_permitted", 403)
 			}
 
-			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+			canceledAt := time.Now().UTC()
+			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", canceledAt.Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
 				// tx.Rollback()
-				log.Printf("ROLLBACK UPDATE reservations")
+				// log.Printf("ROLLBACK UPDATE reservations")
 				return err
 			}
 
 			// update cache before commit DB
 			{
+				// TODO: use go-cache instead of redis ?
+				reservation.CanceledAt = &canceledAt
+				reservation.CanceledAtUnix = canceledAt.Unix()
+				saddCanceledReservations([]Reservation{reservation})
+
 				hdel(event.ID, reservation.ID)
 			}
 		}
@@ -1301,38 +1375,67 @@ func main() {
 			}).(map[int64]Sheet)
 		}
 
-		// ORDER BY すると、巨大な一時テーブル作るのでクソ遅い。しなくても、チェック通る、罠
-		rows, err := db.Query("select r.id, r.user_id, r.sheet_id, r.reserved_at, r.canceled_at, e.id as event_id, e.price as event_price from reservations r inner join events e on e.id = r.event_id")
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		var loopIndex = 0
-		var count int
-		db.QueryRow("select COUNT(*) from reservations").Scan(&count)
-
-		var reports = make([]Report, count)
-		var wg sync.WaitGroup
-		wg.Add(count)
-
-		for rows.Next() {
-			var reservation Reservation
-			var event Event
-			if err := rows.Scan(&reservation.ID, &reservation.UserID, &reservation.SheetID, &reservation.ReservedAt, &reservation.CanceledAt, &event.ID, &event.Price); err != nil {
-				return err
+		var reservations []*Reservation
+		events := map[int64]Event{}
+		{
+			rows, _ := db.Query("select id, price from events")
+			defer rows.Close()
+			for rows.Next() {
+				var eid int64
+				var price int64
+				if err := rows.Scan(&eid, &price); err != nil {
+					return err
+				}
+				e := Event{
+					ID:    eid,
+					Price: price,
+				}
+				events[eid] = e
 			}
 
-			go func(reservation Reservation, event Event, loopIndex int) {
+			// キャンセルしてないもの、しているものすべてを取得する
+			for key := range events {
+				notCanceled, _ := getReservationsFromCache(key, nil)
+				if len(notCanceled) > 0 {
+					reservations = append(reservations, notCanceled...)
+				}
+			}
+
+			// // =========
+			// bfTime := time.Now()
+			// // =========
+
+			// TODO: go-cacheにする
+			canceled, _ := getCanceledReservationsFromCache()
+			log.Printf("CANCELED ### %v", len(canceled))
+
+			if len(canceled) > 0 {
+				reservations = append(reservations, canceled...)
+			}
+
+			// // =========
+			// afTime := time.Now()
+			// log.Printf("##### FETCH TIME: %f #####", afTime.Sub(bfTime).Seconds())
+			// // =========
+		}
+
+		var wg sync.WaitGroup
+		var reports = make([]Report, len(reservations))
+		wg.Add(len(reservations))
+		log.Print(len(reservations))
+
+		for i, reservation := range reservations {
+			go func(reservation *Reservation, loopIndex int) {
 				defer wg.Done()
 
 				// get from map
+				event := events[reservation.EventID]
 				sheet := sheetsMap[reservation.SheetID]
 
 				report := Report{
 					ReservationID: reservation.ID,
 					UserID:        reservation.UserID,
-					SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
+					SoldAt:        time.Unix(reservation.ReservedAtUnix, 0).Format("2006-01-02T15:04:05.000000Z"),
 					Rank:          sheet.Rank,
 					Num:           sheet.Num,
 					Price:         event.Price + sheet.Price,
@@ -1340,11 +1443,11 @@ func main() {
 				}
 				if reservation.CanceledAt != nil {
 					report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+				} else if reservation.CanceledAtUnix != 0 {
+					report.CanceledAt = time.Unix(reservation.CanceledAtUnix, 0).Format("2006-01-02T15:04:05.000000Z")
 				}
 				reports[loopIndex] = report
-			}(reservation, event, loopIndex)
-
-			loopIndex++
+			}(reservation, i)
 		}
 
 		wg.Wait()
