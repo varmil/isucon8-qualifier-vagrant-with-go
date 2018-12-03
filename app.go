@@ -356,18 +356,22 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
 	var reservationID int64
 	var sheet Sheet
-	key := "reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)
 
 	// LOCK with SETNX
-	lockKey := "isLocked." + rank + key
-	acquire, err := redisCli.SetNX(lockKey, true, 3*time.Second).Result()
-	if acquire == false {
-		return 0, Sheet{}, ErrCantAcquireLock
-	}
+	// key := "reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)
+	// lockKey := "isLocked." + rank + key
+	// acquire, err := redisCli.SetNX(lockKey, true, 3*time.Second).Result()
+	// if acquire == false {
+	// 	return 0, Sheet{}, ErrCantAcquireLock
+	// }
 
 	// // =========
 	// bfTime := time.Now()
 	// // =========
+
+	// LOCK
+	insertRMX.Lock()
+	// defer insertRMX.Unlock()
 
 	// 空席を探すために、予約済みの座席を検索する
 	// fetch reserved sheetIDs of the event
@@ -382,20 +386,21 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	// 空席を探す
 	// fetch a NOT reserved sheet
 	if x, found := goCache.Get("sheetsSlice"); found {
-		EmptrySheets := funk.Filter(x.([]Sheet), func(x Sheet) bool {
+		emptrySheets := funk.Filter(x.([]Sheet), func(x Sheet) bool {
 			return x.Rank == rank && !funk.ContainsInt64(sheetIDs, x.ID)
 		}).([]Sheet)
 
-		if len(EmptrySheets) == 0 {
-			redisCli.Del(lockKey)
+		if len(emptrySheets) == 0 {
+			// redisCli.Del(lockKey)
+			insertRMX.Unlock()
 			return 0, Sheet{}, sql.ErrNoRows
 		}
 
 		var randomInt int
-		if len(EmptrySheets) > 1 {
-			randomInt = funk.RandomInt(0, len(EmptrySheets)-1)
+		if len(emptrySheets) > 1 {
+			randomInt = funk.RandomInt(0, len(emptrySheets)-1)
 		}
-		sheet = EmptrySheets[randomInt]
+		sheet = emptrySheets[randomInt]
 	}
 
 	// // =========
@@ -410,14 +415,16 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	{
 		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
 		myCache.HSet(event.ID, reservationID, &reservation)
-		redisCli.Del(lockKey)
+		// redisCli.Del(lockKey)
+		insertRMX.Unlock()
 	}
 
-	_, err = db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, time.Format("2006-01-02 15:04:05.000000"))
-	if err != nil {
-		redisCli.Del(lockKey)
-		return 0, Sheet{}, err
-	}
+	_, _ = db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, time.Format("2006-01-02 15:04:05.000000"))
+	// if err != nil {
+	// 	// redisCli.Del(lockKey)
+	// 	insertRMX.Unlock()
+	// 	return 0, Sheet{}, err
+	// }
 
 	return reservationID, sheet, err
 }
@@ -464,7 +471,8 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 
 var db *sql.DB
 var goCache *cache.Cache
-var mx *sync.Mutex
+var canceledRMX *sync.Mutex
+var insertRMX *sync.Mutex
 var redisCli *redis.Client
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
@@ -511,7 +519,8 @@ func main() {
 	}
 
 	// mutex
-	mx = new(sync.Mutex)
+	canceledRMX = new(sync.Mutex)
+	insertRMX = new(sync.Mutex)
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -844,32 +853,40 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		var loopCount = 0
+		// var loopCount = 0
 		var reservationID int64
 		var sheet Sheet
-		for {
-			reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
-			if err == ErrCantAcquireLock {
-				loopCount++
-				// NOTE: 長く待っている人ほどスリープ時間を短くする
-				// log.Printf("##### LOCK WAIT ERROR ##### %v", loopCount)
-				time.Sleep(time.Duration(100/loopCount) * time.Millisecond)
-				continue
-			} else if err == sql.ErrNoRows {
-				// レスポンスを返すエラー
-				return resError(c, "sold_out", 409)
-			} else if err == redis.TxFailedErr {
-				// WATCH のエラー
-				continue
-			} else if err != nil {
-				// その他
-				log.Printf("##### OTHER ERROR ##### %v", err)
-				break
-			} else {
-				// 正常
-				break
-			}
+		reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
+		if err == sql.ErrNoRows {
+			// レスポンスを返すエラー
+			return resError(c, "sold_out", 409)
+		} else if err != nil {
+			return err
 		}
+
+		// for {
+		// reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
+		// if err == ErrCantAcquireLock {
+		// 	loopCount++
+		// 	// NOTE: 長く待っている人ほどスリープ時間を短くする
+		// 	// log.Printf("##### LOCK WAIT ERROR ##### %v", loopCount)
+		// 	time.Sleep(time.Duration(200/loopCount) * time.Millisecond)
+		// 	continue
+		// } else if err == sql.ErrNoRows {
+		// 	// レスポンスを返すエラー
+		// 	return resError(c, "sold_out", 409)
+		// } else if err == redis.TxFailedErr {
+		// 	// WATCH のエラー
+		// 	continue
+		// } else if err != nil {
+		// 	// その他
+		// 	log.Printf("##### OTHER ERROR ##### %v", err)
+		// 	break
+		// } else {
+		// 	// 正常
+		// 	break
+		// }
+		// }
 
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
@@ -940,9 +957,9 @@ func main() {
 				// append to canceledReservations cache
 				reservation.CanceledAt = &canceledAt
 				reservation.CanceledAtUnix = canceledAt.Unix()
-				mx.Lock()
+				canceledRMX.Lock()
 				canceledReservations = append(canceledReservations, &reservation)
-				mx.Unlock()
+				canceledRMX.Unlock()
 
 				// delete notCanceledReservations cache
 				myCache.HDel(event.ID, reservation.ID)
@@ -1184,27 +1201,15 @@ func main() {
 				}
 			}
 
-			// // =========
-			// bfTime := time.Now()
-			// // =========
-
 			canceled := canceledReservations
-			log.Printf("CANCELED ### %v", len(canceled))
-
 			if len(canceled) > 0 {
 				reservations = append(reservations, canceled...)
 			}
-
-			// // =========
-			// afTime := time.Now()
-			// log.Printf("##### FETCH TIME: %f #####", afTime.Sub(bfTime).Seconds())
-			// // =========
 		}
 
 		var wg sync.WaitGroup
 		var reports = make([]Report, len(reservations))
 		wg.Add(len(reservations))
-		log.Print(len(reservations))
 
 		for i, reservation := range reservations {
 			go func(reservation *Reservation, loopIndex int) {
