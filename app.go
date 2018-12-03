@@ -862,14 +862,6 @@ func main() {
 			return err
 		}
 
-		// tx, err := db.Begin()
-		// if err != nil {
-		// 	return err
-		// }
-
-		// TODO: USE SETNX
-		// key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-
 		{
 			// fetch the first reserved record of the event
 			reservations, err := myCache.FetchAndCacheReservations(db, []int64{event.ID})
@@ -887,17 +879,11 @@ func main() {
 			reservation := *(found.(*Reservation))
 
 			if reservation.UserID != user.ID {
-				// tx.Rollback()
 				log.Printf("403 (DELETE RESERVATIONS) RUID: %v, sessionUID: %v", reservation.UserID, user.ID)
 				return resError(c, "not_permitted", 403)
 			}
 
 			canceledAt := time.Now().UTC()
-			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", canceledAt.Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
-				// tx.Rollback()
-				// log.Printf("ROLLBACK UPDATE reservations")
-				return err
-			}
 
 			// update cache before commit DB
 			{
@@ -908,12 +894,11 @@ func main() {
 
 				myCache.HDel(event.ID, reservation.ID)
 			}
-		}
 
-		// if err := tx.Commit(); err != nil {
-		// 	log.Printf("ERR when commiting UPDATE reservations")
-		// 	return err
-		// }
+			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", canceledAt.Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+				return err
+			}
+		}
 
 		return c.NoContent(204)
 	}, loginRequired)
@@ -1109,7 +1094,6 @@ func main() {
 		return renderReportCSV(c, &reports)
 	}, adminLoginRequired)
 
-	// TODO: tuning
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
 		// get cache of sheets
 		var sheetsMap map[int64]Sheet
