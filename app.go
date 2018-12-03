@@ -21,7 +21,7 @@
  *  9510  : getEvents()が内部で大量にgetEvent()をcallしていたので、呼出回数を実質１回にした。 /api/users/:id が次のボトルネックっぽい。
  * 26078  : WIP getEventsInをcacheしたがrace conditionで弾かれるので、ロックを入れないと駄目かも
  * 19292  : WIP ↑引き続き。Cache更新タイミングをトランザクションのcommit後に変更することで若干緩和。/actions/reservations のFOR UPDATEを削除
- * 9k-29k : WIP ↑引き続き。 fetchAndCacheReservations() に順次置き換え
+ * 9k-29k : WIP ↑引き続き。 myCache.FetchAndCacheReservations() に順次置き換え
  * 37k    : WIP ↑引き続き。 マニュアルをもう一度読む。/admin/api/reports/sales が原因で負荷レベルが上がらない。ORDER BYせずとも何とPASSした。罠。
  * refactor goCache --> redis
  * refactor WATCH（SETNX）を使うか、HASH型にしてATOMICに書き換えできるようにする。
@@ -44,7 +44,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,84 +61,13 @@ import (
 	"github.com/patrickmn/go-cache"
 	funk "github.com/thoas/go-funk"
 
+	myCache "torb/cache"
 	sess "torb/session"
+	. "torb/structs"
 )
-
-type User struct {
-	ID        int64  `json:"id,omitempty"`
-	Nickname  string `json:"nickname,omitempty"`
-	LoginName string `json:"login_name,omitempty"`
-	PassHash  string `json:"pass_hash,omitempty"`
-}
-
-type Event struct {
-	ID       int64  `json:"id,omitempty"`
-	Title    string `json:"title,omitempty"`
-	PublicFg bool   `json:"public,omitempty"`
-	ClosedFg bool   `json:"closed,omitempty"`
-	Price    int64  `json:"price,omitempty"`
-
-	Total   int                `json:"total"`
-	Remains int                `json:"remains"`
-	Sheets  map[string]*Sheets `json:"sheets,omitempty"`
-}
-
-type Sheets struct {
-	Total   int      `json:"total"`
-	Remains int      `json:"remains"`
-	Detail  []*Sheet `json:"detail,omitempty"`
-	Price   int64    `json:"price"`
-}
-
-type Sheet struct {
-	ID    int64  `json:"-"`
-	Rank  string `json:"-"`
-	Num   int64  `json:"num"`
-	Price int64  `json:"-"`
-
-	Mine           bool       `json:"mine,omitempty"`
-	Reserved       bool       `json:"reserved,omitempty"`
-	ReservedAt     *time.Time `json:"-"`
-	ReservedAtUnix int64      `json:"reserved_at,omitempty"`
-}
-
-type Reservation struct {
-	ID         int64      `json:"id"`
-	EventID    int64      `json:"event_id,omitempty"`
-	SheetID    int64      `json:"sheet_id,omitempty"`
-	UserID     int64      `json:"user_id,omitempty"`
-	ReservedAt *time.Time `json:"-"`
-	CanceledAt *time.Time `json:"-"`
-
-	Event          *Event `json:"event,omitempty"`
-	SheetRank      string `json:"sheet_rank,omitempty"`
-	SheetNum       int64  `json:"sheet_num,omitempty"`
-	Price          int64  `json:"price,omitempty"`
-	ReservedAtUnix int64  `json:"reserved_at,omitempty"`
-	CanceledAtUnix int64  `json:"canceled_at,omitempty"`
-}
-
-type Administrator struct {
-	ID        int64  `json:"id,omitempty"`
-	Nickname  string `json:"nickname,omitempty"`
-	LoginName string `json:"login_name,omitempty"`
-	PassHash  string `json:"pass_hash,omitempty"`
-}
-
-func createRedisClient() *redis.Client {
-	client := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "", // no password set
-		DB:       0,  // use default DB
-	})
-
-	return client
-}
 
 func arrayToString(a []int64, delim string) string {
 	return strings.Trim(strings.Replace(fmt.Sprint(a), " ", delim, -1), "[]")
-	//return strings.Trim(strings.Join(strings.Split(fmt.Sprint(a), " "), delim), "[]")
-	//return strings.Trim(strings.Join(strings.Fields(fmt.Sprint(a)), delim), "[]")
 }
 
 func cacheSheets() {
@@ -277,19 +205,19 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var reservations []*Reservation
 	{
 		// =========
-		bfTime := time.Now()
+		// bfTime := time.Now()
 		// =========
 
 		var err error
-		reservations, err = fetchAndCacheReservations(eventIDs, nil)
+		reservations, err = myCache.FetchAndCacheReservations(db, eventIDs)
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
 		}
 
 		// =========
-		afTime := time.Now()
-		log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// afTime := time.Now()
+		// log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
 		// =========
 	}
 
@@ -321,7 +249,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var reservations []*Reservation
 	var err error
 	{
-		reservations, err = fetchAndCacheReservations([]int64{eventID}, nil)
+		reservations, err = myCache.FetchAndCacheReservations(db, []int64{eventID})
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
@@ -338,189 +266,6 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	// ---------------------------------------
 
 	return &event, nil
-}
-
-/**
- * HGetAll。結果がなければempty slice
- */
-func getReservationsFromCache(eventID int64, pipe redis.Pipeliner) ([]*Reservation, error) {
-	var reservations []*Reservation
-	var val map[string]string
-	var err error
-
-	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-	if pipe == nil {
-		val, err = redisCli.HGetAll(key).Result()
-	} else {
-		val, err = pipe.HGetAll(key).Result()
-	}
-
-	if err != redis.Nil {
-		for _, reservationStr := range funk.Values(val).([]string) {
-			var deserialized *Reservation
-			err = json.Unmarshal([]byte(reservationStr), &deserialized)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			if deserialized.ID != 0 {
-				// log.Printf("HGetAll: eid: %v, len: %v", eventID, deserialized)
-				reservations = append(reservations, deserialized)
-			}
-		}
-	}
-	return reservations, nil
-}
-
-/**
- * SMEMBERS。結果がなければempty slice
- */
-func getCanceledReservationsFromCache() ([]*Reservation, error) {
-	var reservations []*Reservation
-
-	key := "reservations.canceled"
-	val, err := redisCli.SMembers(key).Result()
-
-	if err != redis.Nil {
-		for _, reservationStr := range val {
-			var deserialized *Reservation
-			err = json.Unmarshal([]byte(reservationStr), &deserialized)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			if deserialized.ID != 0 {
-				reservations = append(reservations, deserialized)
-			}
-		}
-	}
-	return reservations, nil
-}
-
-/**
- * HMSET (cause error when use pipe.HMSet)
- */
-func setToCache(eventID int64, reservations []*Reservation, hmset func(key string, fields map[string]interface{}) *redis.StatusCmd) error {
-	if len(reservations) == 0 {
-		// log.Print("reservations is empty, so do nothing")
-		return nil
-	}
-
-	// map []*Reservation to map[string]*Reservation{}
-	reservationsMap := funk.Map(reservations, func(x *Reservation) (string, interface{}) {
-		bytes, err := json.Marshal(x)
-		if err != nil {
-			panic("MAP ERROR")
-		}
-		return strconv.FormatInt(x.ID, 10), bytes
-	}).(map[string]interface{})
-
-	// log.Printf("HMSET: %v, len: %v", eventID, len(reservations))
-	hmset("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), reservationsMap)
-	return nil
-}
-
-/**
- * SADD （REPORT用のキャッシュ）
- */
-func saddCanceledReservations(reservations []Reservation) error {
-	if len(reservations) == 0 {
-		return nil
-	}
-
-	var result []interface{}
-	for _, reservation := range reservations {
-		bytes, err := json.Marshal(reservation)
-		if err != nil {
-			panic("MAP ERROR")
-		}
-		result = append(result, bytes)
-	}
-
-	redisCli.SAdd("reservations.canceled", result...)
-	return nil
-}
-
-/**
- * HSET
- */
-func hset(eventID int64, reservationID int64, reservation *Reservation) error {
-	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-	bytes, err := json.Marshal(reservation)
-	if err != nil {
-		panic("MAP ERROR")
-	}
-	redisCli.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
-	return nil
-}
-
-/**
- * HDEL
- */
-func hdel(eventID int64, reservationID int64) error {
-	redisCli.HDel("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10))
-	return nil
-}
-
-func fetchAndCacheReservations(eventIDs []int64, pipe redis.Pipeliner) ([]*Reservation, error) {
-	var reservations []*Reservation
-	var eventIDsForSearching []int64
-
-	// search the cache for each item
-	// TODO: 見つからない場合 == キャッシュがない or 予約ゼロ。後者の場合を区別する
-	{
-		for _, eid := range eventIDs {
-			deserialized, err := getReservationsFromCache(eid, pipe)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			if len(deserialized) > 0 {
-				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-				reservations = append(reservations, deserialized...)
-			} else {
-				// 見つからなければ、検索用IDに追加
-				eventIDsForSearching = append(eventIDsForSearching, eid)
-			}
-		}
-	}
-
-	// SELECT query (slow!)
-	if len(eventIDsForSearching) > 0 {
-		sql := fmt.Sprintf("SELECT id, event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (%s) AND canceled_at IS NULL", arrayToString(eventIDsForSearching, ","))
-		reservationsRows, err := db.Query(sql)
-		if err != nil {
-			log.Fatal(err)
-			return nil, err
-		}
-		defer reservationsRows.Close()
-		for reservationsRows.Next() {
-			var reservation Reservation
-			if err := reservationsRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
-			reservations = append(reservations, &reservation)
-		}
-
-		// set each item in the cache
-		{
-			for _, eid := range eventIDsForSearching {
-				r := funk.Filter(reservations, func(x *Reservation) bool {
-					return x.EventID == eid
-				})
-				if r != nil {
-					reservationsForEventID := r.([]*Reservation)
-					setToCache(eid, reservationsForEventID, redisCli.HMSet)
-				}
-			}
-		}
-	}
-
-	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
-
-	return reservations, nil
 }
 
 func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
@@ -587,7 +332,7 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 
 	// 空席を探すために、予約済みの座席を検索する
 	// fetch reserved sheetIDs of the event
-	reservations, err := fetchAndCacheReservations([]int64{event.ID}, nil)
+	reservations, err := myCache.FetchAndCacheReservations(db, []int64{event.ID})
 	sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
 		return x.SheetID
 	}).([]int64)
@@ -620,7 +365,7 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	time := time.Now().UTC()
 	{
 		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-		hset(event.ID, reservationID, &reservation)
+		myCache.HSet(event.ID, reservationID, &reservation)
 		redisCli.Del(lockKey)
 	}
 
@@ -708,7 +453,7 @@ func main() {
 
 	// redis
 	{
-		redisCli = createRedisClient()
+		redisCli = myCache.CreateRedisClient()
 		redisCli.FlushAll()
 	}
 
@@ -789,7 +534,7 @@ func main() {
 					reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
 					reservations = append(reservations, reservation)
 				}
-				saddCanceledReservations(reservations)
+				myCache.SAddCanceledReservations(reservations)
 			}
 		}
 
@@ -1127,7 +872,7 @@ func main() {
 
 		{
 			// fetch the first reserved record of the event
-			reservations, err := fetchAndCacheReservations([]int64{event.ID}, nil)
+			reservations, err := myCache.FetchAndCacheReservations(db, []int64{event.ID})
 			if err != nil {
 				log.Fatal(err)
 				return err
@@ -1159,9 +904,9 @@ func main() {
 				// TODO: use go-cache instead of redis ?
 				reservation.CanceledAt = &canceledAt
 				reservation.CanceledAtUnix = canceledAt.Unix()
-				saddCanceledReservations([]Reservation{reservation})
+				myCache.SAddCanceledReservations([]Reservation{reservation})
 
-				hdel(event.ID, reservation.ID)
+				myCache.HDel(event.ID, reservation.ID)
 			}
 		}
 
@@ -1395,7 +1140,7 @@ func main() {
 
 			// キャンセルしてないもの、しているものすべてを取得する
 			for key := range events {
-				notCanceled, _ := getReservationsFromCache(key, nil)
+				notCanceled, _ := myCache.GetReservations(key)
 				if len(notCanceled) > 0 {
 					reservations = append(reservations, notCanceled...)
 				}
@@ -1406,7 +1151,7 @@ func main() {
 			// // =========
 
 			// TODO: go-cacheにする
-			canceled, _ := getCanceledReservationsFromCache()
+			canceled, _ := myCache.GetCanceledReservations()
 			log.Printf("CANCELED ### %v", len(canceled))
 
 			if len(canceled) > 0 {
