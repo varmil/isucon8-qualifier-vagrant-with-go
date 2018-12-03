@@ -427,6 +427,9 @@ var json = jsoniter.ConfigCompatibleWithStandardLibrary
 var reservationUUID int64 = 10000000
 var ErrCantAcquireLock = errors.New("cant acquire lock")
 
+// cache
+var canceledReservations []*Reservation
+
 func main() {
 	var err error
 	// log.SetFlags(log.Lshortfile)
@@ -507,35 +510,37 @@ func main() {
 		}
 
 		// go-cache reset
-		goCache.Flush()
 		{
+			goCache.Flush()
 			cacheSheets()
 		}
 
 		// redis reset
 		{
 			redisCli.FlushAll()
+		}
 
-			// cache canceled reservations
-			{
-				rows, err := db.Query("select id, event_id, user_id, sheet_id, reserved_at, canceled_at from reservations where canceled_at is not null")
-				if err != nil {
+		// cache canceled reservations
+		{
+			canceledReservations = nil
+
+			rows, err := db.Query("select id, event_id, user_id, sheet_id, reserved_at, canceled_at from reservations where canceled_at is not null")
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+
+			var reservations []*Reservation
+			for rows.Next() {
+				var reservation Reservation
+				if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.UserID, &reservation.SheetID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 					return err
 				}
-				defer rows.Close()
-
-				var reservations []Reservation
-				for rows.Next() {
-					var reservation Reservation
-					if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.UserID, &reservation.SheetID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
-						return err
-					}
-					reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
-					reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
-					reservations = append(reservations, reservation)
-				}
-				myCache.SAddCanceledReservations(reservations)
+				reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
+				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
+				reservations = append(reservations, &reservation)
 			}
+			canceledReservations = append(canceledReservations, reservations...)
 		}
 
 		return c.NoContent(204)
@@ -887,11 +892,14 @@ func main() {
 
 			// update cache before commit DB
 			{
-				// TODO: use go-cache instead of redis ?
+				// append to canceledReservations cache
 				reservation.CanceledAt = &canceledAt
 				reservation.CanceledAtUnix = canceledAt.Unix()
-				myCache.SAddCanceledReservations([]Reservation{reservation})
+				mx.Lock()
+				canceledReservations = append(canceledReservations, &reservation)
+				mx.Unlock()
 
+				// delete notCanceledReservations cache
 				myCache.HDel(event.ID, reservation.ID)
 			}
 
@@ -1134,8 +1142,7 @@ func main() {
 			// bfTime := time.Now()
 			// // =========
 
-			// TODO: go-cacheにする
-			canceled, _ := myCache.GetCanceledReservations()
+			canceled := canceledReservations
 			log.Printf("CANCELED ### %v", len(canceled))
 
 			if len(canceled) > 0 {

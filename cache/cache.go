@@ -17,6 +17,9 @@ import (
 
 var redisCli *redis.Client
 
+/**
+ * コネクションを張って、このパッケージのトップ変数に保持
+ */
 func CreateRedisClient() *redis.Client {
 	client := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
@@ -26,7 +29,6 @@ func CreateRedisClient() *redis.Client {
 
 	// set the connection
 	redisCli = client
-
 	return client
 }
 
@@ -61,27 +63,46 @@ func GetReservations(eventID int64) ([]*Reservation, error) {
 /**
  * SMEMBERS。結果がなければempty slice
  */
-func GetCanceledReservations() ([]*Reservation, error) {
-	var reservations []*Reservation
+// func GetCanceledReservations() ([]*Reservation, error) {
+// 	var reservations []*Reservation
 
-	key := "reservations.canceled"
-	val, err := redisCli.SMembers(key).Result()
+// 	key := "reservations.canceled"
+// 	val, err := redisCli.SMembers(key).Result()
 
-	if err != redis.Nil {
-		for _, reservationStr := range val {
-			var deserialized *Reservation
-			err = json.Unmarshal([]byte(reservationStr), &deserialized)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			if deserialized.ID != 0 {
-				reservations = append(reservations, deserialized)
-			}
-		}
-	}
-	return reservations, nil
-}
+// 	if err != redis.Nil {
+// 		for _, reservationStr := range val {
+// 			var deserialized *Reservation
+// 			err = json.Unmarshal([]byte(reservationStr), &deserialized)
+// 			if err != nil {
+// 				log.Fatal(err)
+// 				return nil, err
+// 			}
+// 			if deserialized.ID != 0 {
+// 				reservations = append(reservations, deserialized)
+// 			}
+// 		}
+// 	}
+// 	return reservations, nil
+// }
+
+// SADD （REPORT用のキャッシュ）
+// func SAddCanceledReservations(reservations []Reservation) error {
+// 	if len(reservations) == 0 {
+// 		return nil
+// 	}
+
+// 	var result []interface{}
+// 	for _, reservation := range reservations {
+// 		bytes, err := json.Marshal(reservation)
+// 		if err != nil {
+// 			panic("MAP ERROR")
+// 		}
+// 		result = append(result, bytes)
+// 	}
+
+// 	redisCli.SAdd("reservations.canceled", result...)
+// 	return nil
+// }
 
 /**
  * HMSET (cause error when use pipe.HMSet)
@@ -106,25 +127,6 @@ func HMSet(eventID int64, reservations []*Reservation, hmset func(key string, fi
 	return nil
 }
 
-// SADD （REPORT用のキャッシュ）
-func SAddCanceledReservations(reservations []Reservation) error {
-	if len(reservations) == 0 {
-		return nil
-	}
-
-	var result []interface{}
-	for _, reservation := range reservations {
-		bytes, err := json.Marshal(reservation)
-		if err != nil {
-			panic("MAP ERROR")
-		}
-		result = append(result, bytes)
-	}
-
-	redisCli.SAdd("reservations.canceled", result...)
-	return nil
-}
-
 /**
  * HSET
  */
@@ -146,6 +148,9 @@ func HDel(eventID int64, reservationID int64) error {
 	return nil
 }
 
+/**
+ * MySQLとRedis併用
+ */
 func FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, error) {
 	var reservations []*Reservation
 	var eventIDsForSearching []int64
