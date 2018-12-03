@@ -89,6 +89,21 @@ func cacheSheets() {
 		sheets = append(sheets, sheet)
 	}
 	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
+
+	// set random sheetMap for new reservation
+	{
+		sheets := funk.Shuffle(sheets).([]Sheet)
+		sheetMap := map[string][]Sheet{
+			"S": {},
+			"A": {},
+			"B": {},
+			"C": {},
+		}
+		for _, s := range sheets {
+			sheetMap[s.Rank] = append(sheetMap[s.Rank], s)
+		}
+		goCache.Set("randomSheetMap", sheetMap, cache.DefaultExpiration)
+	}
 }
 
 func loginRequired(next echo.HandlerFunc) echo.HandlerFunc {
@@ -162,10 +177,9 @@ func getEvents(all bool) ([]*Event, error) {
 		for k := range addedEvents[i].Sheets {
 			addedEvents[i].Sheets[k].Detail = nil
 		}
-		events[i] = addedEvents[i]
 	}
 
-	return events, nil
+	return addedEvents, nil
 }
 
 func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
@@ -357,8 +371,8 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	var reservationID int64
 	var sheet Sheet
 
-	x, _ := goCache.Get("sheetsSlice")
-	sheets := x.([]Sheet)
+	x, _ := goCache.Get("randomSheetMap")
+	sheetMap := x.(map[string][]Sheet)
 
 	// LOCK
 	insertRMX.Lock()
@@ -381,20 +395,14 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	// 空席を探す
 	// fetch a NOT reserved sheet
 	{
-		emptrySheets := funk.Filter(sheets, func(x Sheet) bool {
-			return x.Rank == rank && !funk.ContainsInt64(sheetIDs, x.ID)
-		}).([]Sheet)
-
-		if len(emptrySheets) == 0 {
+		emptrySheet := funk.Find(sheetMap[rank], func(x Sheet) bool {
+			return !funk.ContainsInt64(sheetIDs, x.ID)
+		})
+		if emptrySheet == nil {
 			insertRMX.Unlock()
 			return 0, Sheet{}, sql.ErrNoRows
 		}
-
-		var randomInt int
-		if len(emptrySheets) > 1 {
-			randomInt = funk.RandomInt(0, len(emptrySheets)-1)
-		}
-		sheet = emptrySheets[randomInt]
+		sheet = emptrySheet.(Sheet)
 	}
 
 	// 早くLOCK解除するためにreservationIDを手動で採番してCacheぶち込み
