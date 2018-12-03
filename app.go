@@ -357,21 +357,16 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	var reservationID int64
 	var sheet Sheet
 
-	// LOCK with SETNX
-	// key := "reservations.notCanceled.eid." + strconv.FormatInt(event.ID, 10)
-	// lockKey := "isLocked." + rank + key
-	// acquire, err := redisCli.SetNX(lockKey, true, 3*time.Second).Result()
-	// if acquire == false {
-	// 	return 0, Sheet{}, ErrCantAcquireLock
-	// }
-
-	// // =========
-	// bfTime := time.Now()
-	// // =========
+	x, _ := goCache.Get("sheetsSlice")
+	sheets := x.([]Sheet)
 
 	// LOCK
 	insertRMX.Lock()
 	// defer insertRMX.Unlock()
+
+	// // =========
+	// bfTime := time.Now()
+	// // =========
 
 	// 空席を探すために、予約済みの座席を検索する
 	// fetch reserved sheetIDs of the event
@@ -385,13 +380,12 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 
 	// 空席を探す
 	// fetch a NOT reserved sheet
-	if x, found := goCache.Get("sheetsSlice"); found {
-		emptrySheets := funk.Filter(x.([]Sheet), func(x Sheet) bool {
+	{
+		emptrySheets := funk.Filter(sheets, func(x Sheet) bool {
 			return x.Rank == rank && !funk.ContainsInt64(sheetIDs, x.ID)
 		}).([]Sheet)
 
 		if len(emptrySheets) == 0 {
-			// redisCli.Del(lockKey)
 			insertRMX.Unlock()
 			return 0, Sheet{}, sql.ErrNoRows
 		}
@@ -403,23 +397,23 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 		sheet = emptrySheets[randomInt]
 	}
 
+	// 早くLOCK解除するためにreservationIDを手動で採番してCacheぶち込み
+	atomic.AddInt64(&reservationUUID, 1)
+	reservationID = atomic.LoadInt64(&reservationUUID)
+	utcTime := time.Now().UTC()
+	{
+		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
+		myCache.HSet(event.ID, reservationID, &reservation)
+	}
+
 	// // =========
 	// afTime := time.Now()
 	// log.Printf("##### NEW RESERVE: SEARCH TIME: %f #####", afTime.Sub(bfTime).Seconds())
 	// // =========
 
-	// 早くLOCK解除するためにreservationIDを手動で採番してCacheぶち込み
-	atomic.AddInt64(&reservationUUID, 1)
-	reservationID = atomic.LoadInt64(&reservationUUID)
-	time := time.Now().UTC()
-	{
-		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &time, ReservedAtUnix: time.Unix()}
-		myCache.HSet(event.ID, reservationID, &reservation)
-		// redisCli.Del(lockKey)
-		insertRMX.Unlock()
-	}
+	insertRMX.Unlock()
 
-	_, _ = db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, time.Format("2006-01-02 15:04:05.000000"))
+	_, _ = db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
 	// if err != nil {
 	// 	// redisCli.Del(lockKey)
 	// 	insertRMX.Unlock()
@@ -863,30 +857,6 @@ func main() {
 		} else if err != nil {
 			return err
 		}
-
-		// for {
-		// reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
-		// if err == ErrCantAcquireLock {
-		// 	loopCount++
-		// 	// NOTE: 長く待っている人ほどスリープ時間を短くする
-		// 	// log.Printf("##### LOCK WAIT ERROR ##### %v", loopCount)
-		// 	time.Sleep(time.Duration(200/loopCount) * time.Millisecond)
-		// 	continue
-		// } else if err == sql.ErrNoRows {
-		// 	// レスポンスを返すエラー
-		// 	return resError(c, "sold_out", 409)
-		// } else if err == redis.TxFailedErr {
-		// 	// WATCH のエラー
-		// 	continue
-		// } else if err != nil {
-		// 	// その他
-		// 	log.Printf("##### OTHER ERROR ##### %v", err)
-		// 	break
-		// } else {
-		// 	// 正常
-		// 	break
-		// }
-		// }
 
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
