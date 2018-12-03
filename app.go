@@ -29,7 +29,8 @@
  * 18k    : 更に速く正確にLOCK解除するためにINSERT時にReservationIDを手動で採番する。
  * 45k    : Vagrantfileをいじって、本番スペックに近づけた。UPDATE時のWATCH排除。まだ不安定。
  * 30-55k : /admin/api/reports/sales で go func を利用。rows.Scan がまだ遅い？
- * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い
+ * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い （win）
+ * 25-45k : /admin/api/reports/sales : canceledReservationsをredisからオンメモリにした。次は /admin/ or /actions/reserve （mac）
  *
  */
 package main
