@@ -16,14 +16,14 @@ type Event struct {
 	ClosedFg bool   `json:"closed,omitempty"`
 	Price    int64  `json:"price,omitempty"`
 
-	Total   int                `json:"total"`
-	Remains int                `json:"remains"`
+	Total   int32              `json:"total"`
+	Remains int32              `json:"remains"`
 	Sheets  map[string]*Sheets `json:"sheets,omitempty"`
 }
 
 type Sheets struct {
-	Total   int      `json:"total"`
-	Remains int      `json:"remains"`
+	Total   int32    `json:"total"`
+	Remains int32    `json:"remains"`
 	Detail  []*Sheet `json:"detail,omitempty"`
 	Price   int64    `json:"price"`
 }

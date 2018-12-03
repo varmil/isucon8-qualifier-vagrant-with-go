@@ -45,6 +45,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -152,8 +153,6 @@ func getEvents(all bool) ([]*Event, error) {
 		events = append(events, &event)
 	}
 
-	// bfTime := time.Now()
-
 	ids := funk.Map(events, func(x *Event) int64 {
 		return x.ID
 	})
@@ -164,9 +163,6 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 		events[i] = addedEvents[i]
 	}
-
-	// afTime := time.Now()
-	// log.Printf("[getEvents] for loop with getEvent() TIME: %f", afTime.Sub(bfTime).Seconds())
 
 	return events, nil
 }
@@ -223,12 +219,23 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	}
 
 	// ADD INFO
-	for i := range events {
-		err := addEventInfo(events[i], reservations, loginUserID)
-		if err != nil {
-			log.Fatal(err)
-			return nil, err
+	{
+		// =========
+		// bfTime := time.Now()
+		// =========
+
+		for i := range events {
+			err := addEventInfo(events[i], reservations, loginUserID)
+			if err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
 		}
+
+		// =========
+		// afTime := time.Now()
+		// log.Printf("##### [getEventsIn] ADD_EVENT_INFO TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// =========
 	}
 
 	return events, nil
@@ -278,40 +285,65 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 		log.Fatal("SHEETS CACHE NOT FOUND")
 	}
 
-	for _, sheet := range sheets {
-		sheetCopy := Sheet{
-			ID:    sheet.ID,
-			Rank:  sheet.Rank,
-			Num:   sheet.Num,
-			Price: sheet.Price,
-		}
+	// =========
+	// bfTime := time.Now()
+	// =========
 
-		event.Sheets[sheetCopy.Rank].Price = event.Price + sheetCopy.Price
-		event.Total++
-		event.Sheets[sheetCopy.Rank].Total++
+	var wg sync.WaitGroup
+	wg.Add(len(sheets))
+	mx := new(sync.Mutex)
 
-		// sheet_idでfind
-		var reservation Reservation
-		for _, v := range reservations {
-			if v.SheetID == sheetCopy.ID && event.ID == v.EventID {
-				reservation = *v
-				break
+	for i, sheet := range sheets {
+		go func(i int, sheet Sheet) {
+			defer wg.Done()
+
+			sheetCopy := Sheet{
+				ID:    sheet.ID,
+				Rank:  sheet.Rank,
+				Num:   sheet.Num,
+				Price: sheet.Price,
 			}
-		}
 
-		if (Reservation{}) == reservation {
-			// そのシートに予約が入っていない場合
-			event.Remains++
-			event.Sheets[sheetCopy.Rank].Remains++
-		} else {
-			// シートに予約が入っている場合、最もReservedAtが早いものを取得
-			sheetCopy.Mine = reservation.UserID == loginUserID
-			sheetCopy.Reserved = true
-			sheetCopy.ReservedAtUnix = reservation.ReservedAtUnix
-		}
+			event.Sheets[sheetCopy.Rank].Price = event.Price + sheetCopy.Price
+			atomic.AddInt32(&event.Total, 1)
+			atomic.AddInt32(&event.Sheets[sheetCopy.Rank].Total, 1)
 
-		event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
+			// sheet_idでfind
+			var reservation Reservation
+			for _, v := range reservations {
+				if v.SheetID == sheetCopy.ID && event.ID == v.EventID {
+					reservation = *v
+					break
+				}
+			}
+
+			if (Reservation{}) == reservation {
+				// そのシートに予約が入っていない場合
+				atomic.AddInt32(&event.Remains, 1)
+				atomic.AddInt32(&event.Sheets[sheetCopy.Rank].Remains, 1)
+			} else {
+				// シートに予約が入っている場合、最もReservedAtが早いものを取得
+				sheetCopy.Mine = reservation.UserID == loginUserID
+				sheetCopy.Reserved = true
+				sheetCopy.ReservedAtUnix = reservation.ReservedAtUnix
+			}
+
+			mx.Lock()
+			event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
+			mx.Unlock()
+		}(i, sheet)
 	}
+
+	wg.Wait()
+	sort.Slice(event.Sheets["S"].Detail, func(i, j int) bool { return event.Sheets["S"].Detail[i].ID < event.Sheets["S"].Detail[j].ID })
+	sort.Slice(event.Sheets["A"].Detail, func(i, j int) bool { return event.Sheets["A"].Detail[i].ID < event.Sheets["A"].Detail[j].ID })
+	sort.Slice(event.Sheets["B"].Detail, func(i, j int) bool { return event.Sheets["B"].Detail[i].ID < event.Sheets["B"].Detail[j].ID })
+	sort.Slice(event.Sheets["C"].Detail, func(i, j int) bool { return event.Sheets["C"].Detail[i].ID < event.Sheets["C"].Detail[j].ID })
+
+	// =========
+	// afTime := time.Now()
+	// log.Printf("##### [getEventsIn] SSS TIME: %f #####", afTime.Sub(bfTime).Seconds())
+	// =========
 
 	return nil
 }
@@ -922,6 +954,7 @@ func main() {
 
 		return c.NoContent(204)
 	}, loginRequired)
+
 	e.GET("/admin/", func(c echo.Context) error {
 		var events []*Event
 		administrator := c.Get("administrator")
