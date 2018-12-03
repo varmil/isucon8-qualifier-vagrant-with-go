@@ -318,6 +318,7 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 
 /**
  * INSERT INTO reservations
+ * TODO: tuning
  */
 func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
 	var reservationID int64
@@ -330,6 +331,10 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	if acquire == false {
 		return 0, Sheet{}, ErrCantAcquireLock
 	}
+
+	// // =========
+	// bfTime := time.Now()
+	// // =========
 
 	// 空席を探すために、予約済みの座席を検索する
 	// fetch reserved sheetIDs of the event
@@ -359,6 +364,11 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 		}
 		sheet = EmptrySheets[randomInt]
 	}
+
+	// // =========
+	// afTime := time.Now()
+	// log.Printf("##### NEW RESERVE: SEARCH TIME: %f #####", afTime.Sub(bfTime).Seconds())
+	// // =========
 
 	// 早くLOCK解除するためにreservationIDを手動で採番してCacheぶち込み
 	atomic.AddInt64(&reservationUUID, 1)
@@ -632,7 +642,7 @@ func main() {
 			})
 
 			// =========
-			bfTime := time.Now()
+			// bfTime := time.Now()
 			// =========
 
 			events, err := getEventsIn(eventIDs.([]int64), -1)
@@ -642,8 +652,8 @@ func main() {
 			}
 
 			// =========
-			afTime := time.Now()
-			log.Printf("##### TIME: %f #####", afTime.Sub(bfTime).Seconds())
+			// afTime := time.Now()
+			// log.Printf("##### TIME: %f #####", afTime.Sub(bfTime).Seconds())
 			// =========
 
 			for i := range recentReservations {
@@ -770,6 +780,8 @@ func main() {
 		}
 		return c.JSON(200, sanitizeEvent(event))
 	})
+
+	// TODO: tuning
 	e.POST("/api/events/:id/actions/reserve", func(c echo.Context) error {
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
@@ -805,11 +817,10 @@ func main() {
 		for {
 			reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
 			if err == ErrCantAcquireLock {
-				// ロック待ち
-				if loopCount == 33333 {
-					return resError(c, "timeout", 408)
-				}
 				loopCount++
+				// NOTE: 長く待っている人ほどスリープ時間を短くする
+				// log.Printf("##### LOCK WAIT ERROR ##### %v", loopCount)
+				time.Sleep(time.Duration(100/loopCount) * time.Millisecond)
 				continue
 			} else if err == sql.ErrNoRows {
 				// レスポンスを返すエラー
