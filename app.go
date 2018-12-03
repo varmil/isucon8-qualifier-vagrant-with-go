@@ -23,14 +23,15 @@
  * 19292  : WIP ↑引き続き。Cache更新タイミングをトランザクションのcommit後に変更することで若干緩和。/actions/reservations のFOR UPDATEを削除
  * 9k-29k : WIP ↑引き続き。 myCache.FetchAndCacheReservations() に順次置き換え
  * 37k    : WIP ↑引き続き。 マニュアルをもう一度読む。/admin/api/reports/sales が原因で負荷レベルが上がらない。ORDER BYせずとも何とPASSした。罠。
- * refactor goCache --> redis
- * refactor WATCH（SETNX）を使うか、HASH型にしてATOMICに書き換えできるようにする。
+ *        : refactor goCache --> redis
+ *        : refactor WATCH（SETNX）を使うか、HASH型にしてATOMICに書き換えできるようにする。
  * 25k    : INSERT時にSETNXでLockを入れる。SheetsCache利用。早めにLock解除。まだ不安定
  * 18k    : 更に速く正確にLOCK解除するためにINSERT時にReservationIDを手動で採番する。
  * 45k    : Vagrantfileをいじって、本番スペックに近づけた。UPDATE時のWATCH排除。まだ不安定。
  * 30-55k : /admin/api/reports/sales で go func を利用。rows.Scan がまだ遅い？
  * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い （win）
  * 25-45k : /admin/api/reports/sales : canceledReservationsをredisからオンメモリにした。次は /admin/ or /actions/reserve （mac）
+ * 35-45k : /admin/ : go func() で addEventInfo() をtuning（mac）
  *
  */
 package main
