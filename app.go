@@ -32,7 +32,7 @@
  * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い （win）
  * 25-45k : /admin/api/reports/sales : canceledReservationsをredisからオンメモリにした。次は /admin/ or /actions/reserve （mac）
  * 35-45k : /admin/          : go func() で addEventInfo() をtuning（mac）
- * 55k    : /actions/reserve : Mutex Lock を使わずにAtomic Queueで頑張った
+ * 55k    : /actions/reserve : Mutex Lock を使わずにAtomic Queueで頑張った。MySQLのmax_connectionsを増やした。 http://wakariyasui.hatenablog.jp/entry/2015/04/28/005109
  *
  */
 package main
@@ -915,13 +915,13 @@ func main() {
 
 			// update cache before commit DB
 			{
-				// delete notCanceledReservations cache
-				myCache.HDel(event.ID, reservation.ID)
-
 				// append to non-reserved sheets cache
 				x, _ := goCache.Get("randomSheetMap")
 				sheetMap := x.(map[int64]map[string]*fifo.Queue)
 				sheetMap[event.ID][rank].Add(sheet)
+
+				// delete notCanceledReservations cache
+				myCache.HDel(event.ID, reservation.ID)
 
 				// sales用なので多少遅れても良さそう
 				// append to canceledReservations cache
