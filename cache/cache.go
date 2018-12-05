@@ -2,7 +2,6 @@ package cache
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -12,9 +11,11 @@ import (
 	. "torb/structs"
 
 	"github.com/go-redis/redis"
+	"github.com/json-iterator/go"
 	funk "github.com/thoas/go-funk"
 )
 
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 var redisCli *redis.Client
 
 /**
@@ -59,50 +60,6 @@ func GetReservations(eventID int64) ([]*Reservation, error) {
 	}
 	return reservations, nil
 }
-
-/**
- * SMEMBERS。結果がなければempty slice
- */
-// func GetCanceledReservations() ([]*Reservation, error) {
-// 	var reservations []*Reservation
-
-// 	key := "reservations.canceled"
-// 	val, err := redisCli.SMembers(key).Result()
-
-// 	if err != redis.Nil {
-// 		for _, reservationStr := range val {
-// 			var deserialized *Reservation
-// 			err = json.Unmarshal([]byte(reservationStr), &deserialized)
-// 			if err != nil {
-// 				log.Fatal(err)
-// 				return nil, err
-// 			}
-// 			if deserialized.ID != 0 {
-// 				reservations = append(reservations, deserialized)
-// 			}
-// 		}
-// 	}
-// 	return reservations, nil
-// }
-
-// SADD （REPORT用のキャッシュ）
-// func SAddCanceledReservations(reservations []Reservation) error {
-// 	if len(reservations) == 0 {
-// 		return nil
-// 	}
-
-// 	var result []interface{}
-// 	for _, reservation := range reservations {
-// 		bytes, err := json.Marshal(reservation)
-// 		if err != nil {
-// 			panic("MAP ERROR")
-// 		}
-// 		result = append(result, bytes)
-// 	}
-
-// 	redisCli.SAdd("reservations.canceled", result...)
-// 	return nil
-// }
 
 /**
  * HMSET (cause error when use pipe.HMSet)

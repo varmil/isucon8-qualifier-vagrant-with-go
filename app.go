@@ -214,6 +214,10 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 
 	// EVENTS
 	{
+		// =========
+		// bfTime := time.Now()
+		// =========
+
 		sql := fmt.Sprintf("SELECT * FROM events WHERE id IN (%s)", inClause)
 		eventRows, err := db.Query(sql)
 		if err != nil {
@@ -236,6 +240,11 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 			}
 			events = append(events, &event)
 		}
+
+		// =========
+		// afTime := time.Now()
+		// log.Printf("##### FETCHALLEVENT TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// =========
 	}
 
 	// RESERVATIONS
