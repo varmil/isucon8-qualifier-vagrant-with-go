@@ -478,7 +478,6 @@ var db *sql.DB
 var redisCli *myCache.MyRedisCli
 var goCache *cache.Cache
 var canceledRMX *sync.Mutex
-var insertRMX *sync.Mutex
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 var reservationUUID int64 = 10000000
@@ -525,7 +524,6 @@ func main() {
 
 	// mutex
 	canceledRMX = new(sync.Mutex)
-	insertRMX = new(sync.Mutex)
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -580,40 +578,7 @@ func main() {
 
 		// cache non-canceled reservations
 		{
-			var reservations []*Reservation
-
-			reservationsRows, err := db.Query("SELECT id, event_id, sheet_id, user_id, reserved_at FROM reservations WHERE canceled_at IS NULL")
-			if err != nil {
-				log.Fatal(err)
-				return err
-			}
-			defer reservationsRows.Close()
-			for reservationsRows.Next() {
-				var reservation Reservation
-				if err := reservationsRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
-					log.Fatal(err)
-					return err
-				}
-				reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
-				reservations = append(reservations, &reservation)
-			}
-
-			// set each item in the cache
-			{
-				eventIDs := funk.UniqInt64(funk.Map(reservations, func(x *Reservation) int64 {
-					return x.EventID
-				}).([]int64))
-
-				for _, eid := range eventIDs {
-					r := funk.Filter(reservations, func(x *Reservation) bool {
-						return x.EventID == eid
-					}).([]*Reservation)
-					if len(r) != 0 {
-						// log.Printf("CACHE SET eid %v", eid)
-						redisCli.HashMSet(eid, r)
-					}
-				}
-			}
+			myCache.InitNonCanceledReservations(db)
 		}
 
 		// cache canceled reservations
