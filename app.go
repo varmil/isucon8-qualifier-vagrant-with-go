@@ -256,15 +256,20 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		// =========
 		// bfTime := time.Now()
 		// =========
+		var wg sync.WaitGroup
+		wg.Add(len(events))
 
 		for i := range events {
-			err := addEventInfo(events[i], reservations, loginUserID)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
+			go func(i int) {
+				defer wg.Done()
+				err := addEventInfo(events[i], reservations, loginUserID)
+				if err != nil {
+					panic(err)
+				}
+			}(i)
 		}
 
+		wg.Wait()
 		// =========
 		// afTime := time.Now()
 		// log.Printf("##### [getEventsIn] ADD_EVENT_INFO TIME: %f #####", afTime.Sub(bfTime).Seconds())
@@ -318,10 +323,6 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 		log.Fatal("SHEETS CACHE NOT FOUND")
 	}
 
-	// =========
-	// bfTime := time.Now()
-	// =========
-
 	var wg sync.WaitGroup
 	wg.Add(len(sheets))
 	mx := new(sync.Mutex)
@@ -368,10 +369,19 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 	}
 
 	wg.Wait()
-	sort.Slice(event.Sheets["S"].Detail, func(i, j int) bool { return event.Sheets["S"].Detail[i].ID < event.Sheets["S"].Detail[j].ID })
-	sort.Slice(event.Sheets["A"].Detail, func(i, j int) bool { return event.Sheets["A"].Detail[i].ID < event.Sheets["A"].Detail[j].ID })
-	sort.Slice(event.Sheets["B"].Detail, func(i, j int) bool { return event.Sheets["B"].Detail[i].ID < event.Sheets["B"].Detail[j].ID })
-	sort.Slice(event.Sheets["C"].Detail, func(i, j int) bool { return event.Sheets["C"].Detail[i].ID < event.Sheets["C"].Detail[j].ID })
+
+	// =========
+	// bfTime := time.Now()
+	// =========
+
+	wg.Add(4)
+	for rank, sheets := range event.Sheets {
+		go func(rank string, sheets *Sheets) {
+			defer wg.Done()
+			sort.Slice(sheets.Detail, func(i, j int) bool { return sheets.Detail[i].ID < sheets.Detail[j].ID })
+		}(rank, sheets)
+	}
+	wg.Wait()
 
 	// =========
 	// afTime := time.Now()
