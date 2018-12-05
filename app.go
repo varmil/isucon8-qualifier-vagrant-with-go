@@ -33,6 +33,7 @@
  * 25-45k : /admin/api/reports/sales : canceledReservationsをredisからオンメモリにした。次は /admin/ or /actions/reserve （mac）
  * 35-45k : /admin/          : go func() で addEventInfo() をtuning（mac）
  * 55k    : /actions/reserve : Mutex Lock を使わずにAtomic Queueで頑張った。MySQLのmax_connectionsを増やした。 http://wakariyasui.hatenablog.jp/entry/2015/04/28/005109
+ * 68k    : /                : getEventsIn()を細かく並列化したりループの回数を減らしたり。
  *
  */
 package main
@@ -256,13 +257,20 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		// =========
 		// bfTime := time.Now()
 		// =========
+
+		// slice to map[eventID][]*Reservation
+		data := map[int64][]*Reservation{}
+		for _, r := range reservations {
+			data[r.EventID] = append(data[r.EventID], r)
+		}
+
 		var wg sync.WaitGroup
 		wg.Add(len(events))
 
 		for i := range events {
 			go func(i int) {
 				defer wg.Done()
-				err := addEventInfo(events[i], reservations, loginUserID)
+				err := addEventInfo(events[i], data[events[i].ID], loginUserID)
 				if err != nil {
 					panic(err)
 				}
