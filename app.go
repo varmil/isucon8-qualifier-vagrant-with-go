@@ -31,7 +31,8 @@
  * 30-55k : /admin/api/reports/sales で go func を利用。rows.Scan がまだ遅い？
  * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い （win）
  * 25-45k : /admin/api/reports/sales : canceledReservationsをredisからオンメモリにした。次は /admin/ or /actions/reserve （mac）
- * 35-45k : /admin/ : go func() で addEventInfo() をtuning（mac）
+ * 35-45k : /admin/          : go func() で addEventInfo() をtuning（mac）
+ * 55k    : /actions/reserve : Mutex Lock を使わずにAtomic Queueで頑張った
  *
  */
 package main
@@ -53,6 +54,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/foize/go.fifo"
 	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
@@ -90,19 +92,35 @@ func cacheSheets() {
 	}
 	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
 
+	// { eventID: { sheetRank: Queue of []sheet } }
 	// set random sheetMap for new reservation
 	{
+		const EventLen = int64(18)
+		const MaxEventLen = int64(100)
+
 		sheets := funk.Shuffle(sheets).([]Sheet)
-		sheetMap := map[string][]Sheet{
-			"S": {},
-			"A": {},
-			"B": {},
-			"C": {},
+		data := map[int64]map[string]*fifo.Queue{}
+
+		// 初期イベントは18個。11,12,13は全部空き。それ以外は全部埋まり。
+		// 100くらいまで作っておく
+		for eid := int64(1); eid <= MaxEventLen; eid++ {
+			// initialize the map
+			sheetMap := map[string]*fifo.Queue{
+				"S": fifo.NewQueue(),
+				"A": fifo.NewQueue(),
+				"B": fifo.NewQueue(),
+				"C": fifo.NewQueue(),
+			}
+			// set the map
+			data[eid] = sheetMap
+			// append if the event has non reserved sheets
+			if (eid >= 11 && eid <= 13) || eid > EventLen {
+				for _, s := range sheets {
+					sheetMap[s.Rank].Add(s)
+				}
+			}
 		}
-		for _, s := range sheets {
-			sheetMap[s.Rank] = append(sheetMap[s.Rank], s)
-		}
-		goCache.Set("randomSheetMap", sheetMap, cache.DefaultExpiration)
+		goCache.Set("randomSheetMap", data, cache.DefaultExpiration)
 	}
 }
 
@@ -365,47 +383,22 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 
 /**
  * INSERT INTO reservations
- * TODO: tuning
  */
 func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
 	var reservationID int64
 	var sheet Sheet
 
 	x, _ := goCache.Get("randomSheetMap")
-	sheetMap := x.(map[string][]Sheet)
+	sheetMap := x.(map[int64]map[string]*fifo.Queue)
 
-	// LOCK
-	insertRMX.Lock()
-	// defer insertRMX.Unlock()
-
-	// // =========
-	// bfTime := time.Now()
-	// // =========
-
-	// 空席を探すために、予約済みの座席を検索する
-	// fetch reserved sheetIDs of the event
-	reservations, err := myCache.FetchAndCacheReservations(db, []int64{event.ID})
-	sheetIDs := funk.Map(reservations, func(x *Reservation) int64 {
-		return x.SheetID
-	}).([]int64)
-	if len(sheetIDs) == 0 {
-		sheetIDs = append(sheetIDs, 0)
+	// ロックを使わないためにスレッドセーフなQueueを使ってAtomicに空席をPopする
+	// try to pop non-reserved sheet id from the queue
+	item := sheetMap[event.ID][rank].Next()
+	if item == nil {
+		return 0, Sheet{}, sql.ErrNoRows
 	}
+	sheet = item.(Sheet)
 
-	// 空席を探す
-	// fetch a NOT reserved sheet
-	{
-		emptrySheet := funk.Find(sheetMap[rank], func(x Sheet) bool {
-			return !funk.ContainsInt64(sheetIDs, x.ID)
-		})
-		if emptrySheet == nil {
-			insertRMX.Unlock()
-			return 0, Sheet{}, sql.ErrNoRows
-		}
-		sheet = emptrySheet.(Sheet)
-	}
-
-	// 早くLOCK解除するためにreservationIDを手動で採番してCacheぶち込み
 	atomic.AddInt64(&reservationUUID, 1)
 	reservationID = atomic.LoadInt64(&reservationUUID)
 	utcTime := time.Now().UTC()
@@ -414,21 +407,12 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 		myCache.HSet(event.ID, reservationID, &reservation)
 	}
 
-	// // =========
-	// afTime := time.Now()
-	// log.Printf("##### NEW RESERVE: SEARCH TIME: %f #####", afTime.Sub(bfTime).Seconds())
-	// // =========
+	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
+	if err != nil {
+		return 0, Sheet{}, err
+	}
 
-	insertRMX.Unlock()
-
-	_, _ = db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
-	// if err != nil {
-	// 	// redisCli.Del(lockKey)
-	// 	insertRMX.Unlock()
-	// 	return 0, Sheet{}, err
-	// }
-
-	return reservationID, sheet, err
+	return reservationID, sheet, nil
 }
 
 func sanitizeEvent(e *Event) *Event {
@@ -855,7 +839,6 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		// var loopCount = 0
 		var reservationID int64
 		var sheet Sheet
 		reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
@@ -932,15 +915,21 @@ func main() {
 
 			// update cache before commit DB
 			{
+				// delete notCanceledReservations cache
+				myCache.HDel(event.ID, reservation.ID)
+
+				// append to non-reserved sheets cache
+				x, _ := goCache.Get("randomSheetMap")
+				sheetMap := x.(map[int64]map[string]*fifo.Queue)
+				sheetMap[event.ID][rank].Add(sheet)
+
+				// sales用なので多少遅れても良さそう
 				// append to canceledReservations cache
 				reservation.CanceledAt = &canceledAt
 				reservation.CanceledAtUnix = canceledAt.Unix()
 				canceledRMX.Lock()
 				canceledReservations = append(canceledReservations, &reservation)
 				canceledRMX.Unlock()
-
-				// delete notCanceledReservations cache
-				myCache.HDel(event.ID, reservation.ID)
 			}
 
 			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", canceledAt.Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
@@ -1030,6 +1019,10 @@ func main() {
 			tx.Rollback()
 			return err
 		}
+
+		// 本来ここでrandomSheetMap（go-cache）にINSERTすべきだが、初期化時にズルして
+		// 余分にイベント作成しているのでここでは何もしなくてOKのはず
+
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -1087,6 +1080,8 @@ func main() {
 		if err != nil {
 			return err
 		}
+
+		// NOTE: Closedに変わったとしてもCacheは更新しない（あくまで予約席のキャッシュなので）
 		if _, err := tx.Exec("UPDATE events SET public_fg = ?, closed_fg = ? WHERE id = ?", params.Public, params.Closed, event.ID); err != nil {
 			tx.Rollback()
 			return err
