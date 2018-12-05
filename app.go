@@ -40,6 +40,7 @@
  * 55k    : /actions/reserve : Mutex Lock を使わずにAtomic Queueで頑張った。MySQLのmax_connectionsを増やした。 http://wakariyasui.hatenablog.jp/entry/2015/04/28/005109
  * 68k    : /                : getEventsIn()を細かく並列化したりループの回数を減らしたり。
  * 69k    : /                : MySQLのbuffer_pool_sizeを128MB --> 1G、 max_connectionsを400へ。
+ * 89k    : /                : /initialize で non-canceled reservations をキャッシュ。
  *
  */
 package main
