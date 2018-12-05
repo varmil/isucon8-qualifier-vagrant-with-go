@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	. "torb/structs"
 
@@ -73,78 +74,7 @@ func (cli *MyRedisCli) HashSet(eventID int64, reservationID int64, reservation *
 	return nil
 }
 
-/**
- * HDEL
- */
-func (cli *MyRedisCli) HashDelete(eventID int64, reservationID int64) error {
-	cli.HDel("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10))
-	return nil
-}
-
-/**
- * MySQLとRedis併用
- */
-func (cli *MyRedisCli) FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, error) {
-	var reservations []*Reservation
-	var eventIDsForSearching []int64
-
-	// search the cache for each item
-	// NOTE: 見つからない場合 == キャッシュがない or 予約ゼロ。後者の場合を区別する
-	{
-		for _, eid := range eventIDs {
-			deserialized, err := cli.GetReservations(eid)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			if len(deserialized) > 0 {
-				// 見つかったら結果配列にconcatして、eventIDsから当該IDを削除する（＝検索対象から除外する）
-				reservations = append(reservations, deserialized...)
-			} else {
-				// 見つからなければ、検索用IDに追加
-				eventIDsForSearching = append(eventIDsForSearching, eid)
-			}
-		}
-	}
-
-	// SELECT query (slow!)
-	if len(eventIDsForSearching) > 0 {
-		sql := fmt.Sprintf("SELECT id, event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (%s) AND canceled_at IS NULL", arrayToString(eventIDsForSearching, ","))
-		reservationsRows, err := db.Query(sql)
-		if err != nil {
-			log.Fatal(err)
-			return nil, err
-		}
-		defer reservationsRows.Close()
-		for reservationsRows.Next() {
-			var reservation Reservation
-			if err := reservationsRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
-			reservations = append(reservations, &reservation)
-		}
-
-		// set each item in the cache
-		{
-			for _, eid := range eventIDsForSearching {
-				r := funk.Filter(reservations, func(x *Reservation) bool {
-					return x.EventID == eid
-				})
-				if r != nil {
-					reservationsForEventID := r.([]*Reservation)
-					cli.hashMSet(eid, reservationsForEventID)
-				}
-			}
-		}
-	}
-
-	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
-	return reservations, nil
-}
-
-func (cli *MyRedisCli) hashMSet(eventID int64, reservations []*Reservation) error {
+func (cli *MyRedisCli) HashMSet(eventID int64, reservations []*Reservation) error {
 	if len(reservations) == 0 {
 		return nil
 	}
@@ -161,6 +91,53 @@ func (cli *MyRedisCli) hashMSet(eventID int64, reservations []*Reservation) erro
 	// log.Printf("HMSET: %v, len: %v", eventID, len(reservations))
 	cli.HMSet("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), reservationsMap)
 	return nil
+}
+
+/**
+ * HDEL
+ */
+func (cli *MyRedisCli) HashDelete(eventID int64, reservationID int64) error {
+	cli.HDel("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10))
+	return nil
+}
+
+/**
+ * MySQLとRedis併用
+ */
+func (cli *MyRedisCli) FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, error) {
+	var reservations []*Reservation
+
+	// search the cache for each item
+	// NOTE: 見つからない場合 == 予約ゼロ
+	// ここではすべてキャッシュに乗ってる前提なので、「空」は即ち予約ナシ。
+	{
+		// =========
+		bfTime := time.Now()
+		// =========
+
+		for _, eid := range eventIDs {
+			deserialized, err := cli.GetReservations(eid)
+			if err != nil {
+				log.Fatal(err)
+				return nil, err
+			}
+
+			if len(deserialized) > 0 {
+				// 見つかったら結果配列にconcat
+				reservations = append(reservations, deserialized...)
+			} else {
+				// do nothing
+			}
+		}
+
+		// =========
+		afTime := time.Now()
+		log.Printf("##### HMGET TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// =========
+	}
+
+	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
+	return reservations, nil
 }
 
 func arrayToString(a []int64, delim string) string {
