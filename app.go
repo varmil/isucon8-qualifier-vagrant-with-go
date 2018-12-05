@@ -14,6 +14,11 @@
  * GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/torb" --run
  *
  *
+ * ## MySQL
+ * sudo pkill mysql
+ * sudo -u mysql /bin/sh /usr/bin/mysqld_safe --basedir=/usr &
+ *
+ *
  * ### SCORE LOG
  *   800  : SELECT FOR UPDATE が無駄に見えたので削除。
  *  4810  : getEvent() の reservations テーブルSELECTに関して N+1を解決。reservations.user_id に INDEX追加
