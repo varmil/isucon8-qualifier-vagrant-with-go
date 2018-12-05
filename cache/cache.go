@@ -15,34 +15,33 @@ import (
 	funk "github.com/thoas/go-funk"
 )
 
+// MyRedisCli wraps original redis.Client
+type MyRedisCli redis.Client
+
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
-var redisCli *redis.Client
 
 /**
  * コネクションを張って、このパッケージのトップ変数に保持
  */
-func CreateRedisClient() *redis.Client {
+func CreateRedisClient() *MyRedisCli {
 	client := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
-
-	// set the connection
-	redisCli = client
-	return client
+	return (*MyRedisCli)(client)
 }
 
 /**
  * HGetAll。結果がなければempty slice
  */
-func GetReservations(eventID int64) ([]*Reservation, error) {
+func (cli *MyRedisCli) GetReservations(eventID int64) ([]*Reservation, error) {
 	var reservations []*Reservation
 	var val map[string]string
 	var err error
 
 	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-	val, err = redisCli.HGetAll(key).Result()
+	val, err = cli.HGetAll(key).Result()
 
 	if err != redis.Nil {
 		for _, reservationStr := range funk.Values(val).([]string) {
@@ -62,53 +61,30 @@ func GetReservations(eventID int64) ([]*Reservation, error) {
 }
 
 /**
- * HMSET (cause error when use pipe.HMSet)
- */
-func HMSet(eventID int64, reservations []*Reservation, hmset func(key string, fields map[string]interface{}) *redis.StatusCmd) error {
-	if len(reservations) == 0 {
-		// log.Print("reservations is empty, so do nothing")
-		return nil
-	}
-
-	// map []*Reservation to map[string]*Reservation{}
-	reservationsMap := funk.Map(reservations, func(x *Reservation) (string, interface{}) {
-		bytes, err := json.Marshal(x)
-		if err != nil {
-			panic("MAP ERROR")
-		}
-		return strconv.FormatInt(x.ID, 10), bytes
-	}).(map[string]interface{})
-
-	// log.Printf("HMSET: %v, len: %v", eventID, len(reservations))
-	hmset("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), reservationsMap)
-	return nil
-}
-
-/**
  * HSET
  */
-func HSet(eventID int64, reservationID int64, reservation *Reservation) error {
+func (cli *MyRedisCli) HashSet(eventID int64, reservationID int64, reservation *Reservation) error {
 	key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
 	bytes, err := json.Marshal(reservation)
 	if err != nil {
 		panic("MAP ERROR")
 	}
-	redisCli.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
+	cli.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
 	return nil
 }
 
 /**
  * HDEL
  */
-func HDel(eventID int64, reservationID int64) error {
-	redisCli.HDel("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10))
+func (cli *MyRedisCli) HashDelete(eventID int64, reservationID int64) error {
+	cli.HDel("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10))
 	return nil
 }
 
 /**
  * MySQLとRedis併用
  */
-func FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, error) {
+func (cli *MyRedisCli) FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, error) {
 	var reservations []*Reservation
 	var eventIDsForSearching []int64
 
@@ -116,7 +92,7 @@ func FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, er
 	// NOTE: 見つからない場合 == キャッシュがない or 予約ゼロ。後者の場合を区別する
 	{
 		for _, eid := range eventIDs {
-			deserialized, err := GetReservations(eid)
+			deserialized, err := cli.GetReservations(eid)
 			if err != nil {
 				log.Fatal(err)
 				return nil, err
@@ -158,7 +134,7 @@ func FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, er
 				})
 				if r != nil {
 					reservationsForEventID := r.([]*Reservation)
-					HMSet(eid, reservationsForEventID, redisCli.HMSet)
+					cli.hashMSet(eid, reservationsForEventID)
 				}
 			}
 		}
@@ -166,6 +142,25 @@ func FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, er
 
 	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
 	return reservations, nil
+}
+
+func (cli *MyRedisCli) hashMSet(eventID int64, reservations []*Reservation) error {
+	if len(reservations) == 0 {
+		return nil
+	}
+
+	// map []*Reservation to map[string]*Reservation{}
+	reservationsMap := funk.Map(reservations, func(x *Reservation) (string, interface{}) {
+		bytes, err := json.Marshal(x)
+		if err != nil {
+			panic("MAP ERROR")
+		}
+		return strconv.FormatInt(x.ID, 10), bytes
+	}).(map[string]interface{})
+
+	// log.Printf("HMSET: %v, len: %v", eventID, len(reservations))
+	cli.HMSet("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), reservationsMap)
+	return nil
 }
 
 func arrayToString(a []int64, delim string) string {

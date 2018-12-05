@@ -62,7 +62,6 @@ import (
 	"time"
 
 	"github.com/foize/go.fifo"
-	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
@@ -198,11 +197,6 @@ func getEvents(all bool) ([]*Event, error) {
 		return x.ID
 	})
 	addedEvents, err := getEventsIn(ids.([]int64), -1)
-	for i := range addedEvents {
-		for k := range addedEvents[i].Sheets {
-			addedEvents[i].Sheets[k].Detail = nil
-		}
-	}
 
 	return addedEvents, nil
 }
@@ -210,7 +204,6 @@ func getEvents(all bool) ([]*Event, error) {
 func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var events []*Event
 	inClause := arrayToString(eventIDs, ",")
-	// log.Print(inClause)
 
 	// EVENTS
 	{
@@ -251,19 +244,19 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var reservations []*Reservation
 	{
 		// =========
-		// bfTime := time.Now()
+		bfTime := time.Now()
 		// =========
 
 		var err error
-		reservations, err = myCache.FetchAndCacheReservations(db, eventIDs)
+		reservations, err = redisCli.FetchAndCacheReservations(db, eventIDs)
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
 		}
 
 		// =========
-		// afTime := time.Now()
-		// log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		afTime := time.Now()
+		log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
 		// =========
 	}
 
@@ -285,7 +278,7 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		for i := range events {
 			go func(i int) {
 				defer wg.Done()
-				err := addEventInfo(events[i], data[events[i].ID], loginUserID)
+				err := addEventInfo(events[i], data[events[i].ID], loginUserID, false)
 				if err != nil {
 					panic(err)
 				}
@@ -318,7 +311,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var reservations []*Reservation
 	var err error
 	{
-		reservations, err = myCache.FetchAndCacheReservations(db, []int64{eventID})
+		reservations, err = redisCli.FetchAndCacheReservations(db, []int64{eventID})
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
@@ -327,7 +320,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	// ---------------------------------------
 
 	// ----- シートを走査 ----------------------
-	err = addEventInfo(&event, reservations, loginUserID)
+	err = addEventInfo(&event, reservations, loginUserID, true)
 	if err != nil {
 		log.Fatal(err)
 		return nil, err
@@ -337,14 +330,10 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	return &event, nil
 }
 
-func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
-	// ----- sheets テーブルは不変なのでキャッシュしている -----
-	var sheets []Sheet
-	if x, found := goCache.Get("sheetsSlice"); found {
-		sheets = x.([]Sheet)
-	} else {
-		log.Fatal("SHEETS CACHE NOT FOUND")
-	}
+func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64, useDetail bool) error {
+	// sheets テーブルは不変なのでキャッシュしている
+	x, _ := goCache.Get("sheetsSlice")
+	sheets := x.([]Sheet)
 
 	var wg sync.WaitGroup
 	wg.Add(len(sheets))
@@ -354,21 +343,14 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 		go func(i int, sheet Sheet) {
 			defer wg.Done()
 
-			sheetCopy := Sheet{
-				ID:    sheet.ID,
-				Rank:  sheet.Rank,
-				Num:   sheet.Num,
-				Price: sheet.Price,
-			}
-
-			event.Sheets[sheetCopy.Rank].Price = event.Price + sheetCopy.Price
+			event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
 			atomic.AddInt32(&event.Total, 1)
-			atomic.AddInt32(&event.Sheets[sheetCopy.Rank].Total, 1)
+			atomic.AddInt32(&event.Sheets[sheet.Rank].Total, 1)
 
-			// sheet_idでfind
+			// 最初に入っている予約（最もReservedAtが早いものを取得）
 			var reservation Reservation
 			for _, v := range reservations {
-				if v.SheetID == sheetCopy.ID && event.ID == v.EventID {
+				if v.SheetID == sheet.ID {
 					reservation = *v
 					break
 				}
@@ -377,25 +359,32 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 			if (Reservation{}) == reservation {
 				// そのシートに予約が入っていない場合
 				atomic.AddInt32(&event.Remains, 1)
-				atomic.AddInt32(&event.Sheets[sheetCopy.Rank].Remains, 1)
+				atomic.AddInt32(&event.Sheets[sheet.Rank].Remains, 1)
 			} else {
-				// シートに予約が入っている場合、最もReservedAtが早いものを取得
-				sheetCopy.Mine = reservation.UserID == loginUserID
-				sheetCopy.Reserved = true
-				sheetCopy.ReservedAtUnix = reservation.ReservedAtUnix
+				// シートに予約が入っている場合
+				sheet.Mine = reservation.UserID == loginUserID
+				sheet.Reserved = true
+				sheet.ReservedAtUnix = reservation.ReservedAtUnix
 			}
 
-			mx.Lock()
-			event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
-			mx.Unlock()
+			if useDetail {
+				sheetCopy := Sheet{
+					ID:             sheet.ID,
+					Rank:           sheet.Rank,
+					Num:            sheet.Num,
+					Price:          sheet.Price,
+					Mine:           sheet.Mine,
+					Reserved:       sheet.Reserved,
+					ReservedAtUnix: sheet.ReservedAtUnix,
+				}
+				mx.Lock()
+				event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
+				mx.Unlock()
+			}
 		}(i, sheet)
 	}
 
 	wg.Wait()
-
-	// =========
-	// bfTime := time.Now()
-	// =========
 
 	wg.Add(4)
 	for rank, sheets := range event.Sheets {
@@ -405,11 +394,6 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 		}(rank, sheets)
 	}
 	wg.Wait()
-
-	// =========
-	// afTime := time.Now()
-	// log.Printf("##### [getEventsIn] SSS TIME: %f #####", afTime.Sub(bfTime).Seconds())
-	// =========
 
 	return nil
 }
@@ -437,7 +421,7 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	utcTime := time.Now().UTC()
 	{
 		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
-		myCache.HSet(event.ID, reservationID, &reservation)
+		redisCli.HashSet(event.ID, reservationID, &reservation)
 	}
 
 	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
@@ -489,10 +473,10 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 }
 
 var db *sql.DB
+var redisCli *myCache.MyRedisCli
 var goCache *cache.Cache
 var canceledRMX *sync.Mutex
 var insertRMX *sync.Mutex
-var redisCli *redis.Client
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 var reservationUUID int64 = 10000000
@@ -925,7 +909,7 @@ func main() {
 
 		{
 			// fetch the first reserved record of the event
-			reservations, err := myCache.FetchAndCacheReservations(db, []int64{event.ID})
+			reservations, err := redisCli.FetchAndCacheReservations(db, []int64{event.ID})
 			if err != nil {
 				log.Fatal(err)
 				return err
@@ -954,7 +938,7 @@ func main() {
 				sheetMap[event.ID][rank].Add(sheet)
 
 				// delete notCanceledReservations cache
-				myCache.HDel(event.ID, reservation.ID)
+				redisCli.HashDelete(event.ID, reservation.ID)
 
 				// sales用なので多少遅れても良さそう
 				// append to canceledReservations cache
@@ -1201,7 +1185,7 @@ func main() {
 
 			// キャンセルしてないもの、しているものすべてを取得する
 			for key := range events {
-				notCanceled, _ := myCache.GetReservations(key)
+				notCanceled, _ := redisCli.GetReservations(key)
 				if len(notCanceled) > 0 {
 					reservations = append(reservations, notCanceled...)
 				}
