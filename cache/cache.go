@@ -6,26 +6,17 @@ import (
 	"log"
 	"sort"
 	"strings"
-	"sync"
 
 	. "torb/structs"
 
 	"github.com/go-redis/redis"
 	"github.com/json-iterator/go"
-	funk "github.com/thoas/go-funk"
 )
 
 // MyRedisCli wraps original redis.Client
 type MyRedisCli redis.Client
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
-
-// cache of non-canceled reservations
-// { eventID: { reservationID: struct-ptr } }
-var nonCanceledReservations = map[int64]map[int64]*Reservation{}
-
-// mutex of non-canceled reservations map
-var muOfNCR sync.RWMutex
 
 /**
  * コネクションを張って、このパッケージのトップ変数に保持
@@ -63,14 +54,12 @@ func InitNonCanceledReservations(db *sql.DB) error {
 	}
 
 	// init map
-	nonCanceledReservations = map[int64]map[int64]*Reservation{}
+	nonCanceledReservations = map[int64]*SyncReservationMap{}
 
-	// set cache
-	eventIDs := funk.UniqInt64(funk.Map(reservations, func(x *Reservation) int64 {
-		return x.EventID
-	}).([]int64))
-	for _, eid := range eventIDs {
-		nonCanceledReservations[eid] = map[int64]*Reservation{}
+	// set cache（適当に十分大きな100くらいまで作っておく）
+	const MaxEventLen = int64(100)
+	for eid := int64(1); eid <= MaxEventLen; eid++ {
+		nonCanceledReservations[eid] = NewSyncReservationMap()
 	}
 	for _, reservation := range reservations {
 		HashSet(reservation.EventID, reservation.ID, reservation)
@@ -83,15 +72,8 @@ func InitNonCanceledReservations(db *sql.DB) error {
 func GetReservations(eventID int64) []*Reservation {
 	reservations := []*Reservation{}
 
-	muOfNCR.RLock()
-	reservationsMap, ok := nonCanceledReservations[eventID]
-	muOfNCR.RUnlock()
-
-	if ok {
-		muOfNCR.RLock()
-		reservations = funk.Values(reservationsMap).([]*Reservation)
-		muOfNCR.RUnlock()
-
+	if syncMap, ok := nonCanceledReservations[eventID]; ok {
+		reservations = syncMap.LoadAll()
 		sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
 	}
 
@@ -125,32 +107,17 @@ func GetReservationsAll(eventIDs []int64) []*Reservation {
 
 // HashSet appends the reservation to cache
 func HashSet(eventID int64, reservationID int64, reservation *Reservation) error {
-	muOfNCR.Lock()
-	defer muOfNCR.Unlock()
-
+	// 初期化時点で十分大きなMapを作っているはずなので、ここで新規作成はありえない
 	if _, ok := nonCanceledReservations[eventID]; !ok {
-		nonCanceledReservations[eventID] = map[int64]*Reservation{}
+		panic("nonCanceledReservations does not have enough eid")
 	}
-	nonCanceledReservations[eventID][reservationID] = reservation
-	return nil
-}
-
-// HashMSet appends the reservations to cache
-func HashMSet(eventID int64, reservations []*Reservation) error {
-	if len(reservations) == 0 {
-		return nil
-	}
-	for _, reservation := range reservations {
-		HashSet(reservation.EventID, reservation.ID, reservation)
-	}
+	nonCanceledReservations[eventID].Store(reservationID, reservation)
 	return nil
 }
 
 // HashDelete deletes the key from cache
 func HashDelete(eventID int64, reservationID int64) error {
-	muOfNCR.Lock()
-	defer muOfNCR.Unlock()
-	delete(nonCanceledReservations[eventID], reservationID)
+	nonCanceledReservations[eventID].Delete(reservationID)
 	return nil
 }
 

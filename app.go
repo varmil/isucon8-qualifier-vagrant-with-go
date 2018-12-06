@@ -383,18 +383,14 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64, 
  * INSERT INTO reservations
  */
 func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
-	// =========
-	bfTime := time.Now()
-	// =========
 
 	var reservationID int64
 	var sheet Sheet
-
 	x, _ := goCache.Get("randomSheetMap")
-	sheetMap := x.(map[int64]map[string]*fifo.Queue)
 
 	// ロックを使わないためにスレッドセーフなQueueを使ってAtomicに空席をPopする
 	// try to pop non-reserved sheet id from the queue
+	sheetMap := x.(map[int64]map[string]*fifo.Queue)
 	item := sheetMap[event.ID][rank].Next()
 	if item == nil {
 		return 0, Sheet{}, sql.ErrNoRows
@@ -404,20 +400,23 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	atomic.AddInt64(&reservationUUID, 1)
 	reservationID = atomic.LoadInt64(&reservationUUID)
 	utcTime := time.Now().UTC()
-	{
-		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
-		myCache.HashSet(event.ID, reservationID, &reservation)
-	}
+	reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
 
-	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
-	if err != nil {
-		return 0, Sheet{}, err
-	}
+	// =========
+	bfTime := time.Now()
+	// =========
+
+	myCache.HashSet(event.ID, reservationID, &reservation)
 
 	// =========
 	afTime := time.Now()
 	log.Printf("##### [tryInsertReservation] TIME: %f #####", afTime.Sub(bfTime).Seconds())
 	// =========
+
+	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
+	if err != nil {
+		return 0, Sheet{}, err
+	}
 
 	return reservationID, sheet, nil
 }
