@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	. "torb/structs"
 
@@ -26,7 +25,7 @@ var json = jsoniter.ConfigCompatibleWithStandardLibrary
 var nonCanceledReservations = map[int64]map[int64]*Reservation{}
 
 // mutex of non-canceled reservations map
-var muOfNCR sync.Mutex
+var muOfNCR sync.RWMutex
 
 /**
  * コネクションを張って、このパッケージのトップ変数に保持
@@ -73,35 +72,27 @@ func InitNonCanceledReservations(db *sql.DB) error {
 
 	// set cache
 	for _, reservation := range reservations {
-		nonCanceledReservations[reservation.EventID][reservation.ID] = reservation
+		HashSet(reservation.EventID, reservation.ID, reservation)
 	}
 
 	return nil
 }
 
 // GetReservations returns the non-canceled reservations for the eventID from cache
-// TODO: tuning
 func GetReservations(eventID int64) []*Reservation {
-	var reservations []*Reservation
+	reservations := []*Reservation{}
 
-	// =========
-	bfTime := time.Now()
-	// =========
+	muOfNCR.RLock()
+	reservationsMap, ok := nonCanceledReservations[eventID]
+	muOfNCR.RUnlock()
 
-	muOfNCR.Lock()
-	defer muOfNCR.Unlock()
-	if reservationsMap, ok := nonCanceledReservations[eventID]; ok {
-		for _, r := range reservationsMap {
-			reservations = append(reservations, r)
-		}
+	if ok {
+		muOfNCR.RLock()
+		reservations = funk.Values(reservationsMap).([]*Reservation)
+		muOfNCR.RUnlock()
 
 		sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
 	}
-
-	// =========
-	afTime := time.Now()
-	log.Printf("##### [FetchAndCacheReservations] TIME: %f #####", afTime.Sub(bfTime).Seconds())
-	// =========
 
 	return reservations
 }
@@ -109,6 +100,10 @@ func GetReservations(eventID int64) []*Reservation {
 // GetReservationsAll returns the non-canceled reservations for the multiple eventIDs from cache
 func GetReservationsAll(eventIDs []int64) []*Reservation {
 	var reservations []*Reservation
+
+	// =========
+	// bfTime := time.Now()
+	// =========
 
 	// NOTE: 見つからない場合 == 予約ゼロ
 	// ここではすべてキャッシュに乗ってる前提なので、「空」は即ち予約ナシ。
@@ -118,6 +113,11 @@ func GetReservationsAll(eventIDs []int64) []*Reservation {
 			reservations = append(reservations, deserialized...)
 		}
 	}
+
+	// =========
+	// afTime := time.Now()
+	// log.Printf("##### [GetReservationsAll] TIME: %f #####", afTime.Sub(bfTime).Seconds())
+	// =========
 
 	return reservations
 }
