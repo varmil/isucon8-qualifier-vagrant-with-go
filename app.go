@@ -241,19 +241,18 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		// =========
 	}
 
-	// TODO: tuning
 	// RESERVATIONS
 	var reservations []*Reservation
 	{
 		// =========
-		bfTime := time.Now()
+		// bfTime := time.Now()
 		// =========
 
 		reservations = myCache.GetReservationsAll(eventIDs)
 
 		// =========
-		afTime := time.Now()
-		log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// afTime := time.Now()
+		// log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
 		// =========
 	}
 

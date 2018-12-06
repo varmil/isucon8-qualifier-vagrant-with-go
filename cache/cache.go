@@ -63,14 +63,15 @@ func InitNonCanceledReservations(db *sql.DB) error {
 	}
 
 	// init map
+	nonCanceledReservations = map[int64]map[int64]*Reservation{}
+
+	// set cache
 	eventIDs := funk.UniqInt64(funk.Map(reservations, func(x *Reservation) int64 {
 		return x.EventID
 	}).([]int64))
 	for _, eid := range eventIDs {
 		nonCanceledReservations[eid] = map[int64]*Reservation{}
 	}
-
-	// set cache
 	for _, reservation := range reservations {
 		HashSet(reservation.EventID, reservation.ID, reservation)
 	}
