@@ -79,11 +79,14 @@ func InitNonCanceledReservations(db *sql.DB) error {
 	return nil
 }
 
-/**
- * HGetAll。結果がなければempty slice
- */
-func (cli *MyRedisCli) GetReservations(eventID int64) ([]*Reservation, error) {
+// GetReservations returns the non-canceled reservations for the eventID from cache
+// TODO: tuning
+func GetReservations(eventID int64) []*Reservation {
 	var reservations []*Reservation
+
+	// =========
+	bfTime := time.Now()
+	// =========
 
 	muOfNCR.Lock()
 	defer muOfNCR.Unlock()
@@ -91,35 +94,36 @@ func (cli *MyRedisCli) GetReservations(eventID int64) ([]*Reservation, error) {
 		for _, r := range reservationsMap {
 			reservations = append(reservations, r)
 		}
-		return reservations, nil
+
+		sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
 	}
-	return []*Reservation{}, nil
 
-	// var reservations []*Reservation
-	// var val map[string]string
-	// var err error
+	// =========
+	afTime := time.Now()
+	log.Printf("##### [FetchAndCacheReservations] TIME: %f #####", afTime.Sub(bfTime).Seconds())
+	// =========
 
-	// key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-	// val, err = cli.HGetAll(key).Result()
-
-	// if err != redis.Nil {
-	// 	for _, reservationStr := range funk.Values(val).([]string) {
-	// 		var deserialized *Reservation
-	// 		err = json.Unmarshal([]byte(reservationStr), &deserialized)
-	// 		if err != nil {
-	// 			log.Fatal(err)
-	// 			return nil, err
-	// 		}
-	// 		if deserialized.ID != 0 {
-	// 			// log.Printf("HGetAll: eid: %v, len: %v", eventID, deserialized)
-	// 			reservations = append(reservations, deserialized)
-	// 		}
-	// 	}
-	// }
-	// return reservations, nil
+	return reservations
 }
 
-func (cli *MyRedisCli) HashSet(eventID int64, reservationID int64, reservation *Reservation) error {
+// GetReservationsAll returns the non-canceled reservations for the multiple eventIDs from cache
+func GetReservationsAll(eventIDs []int64) []*Reservation {
+	var reservations []*Reservation
+
+	// NOTE: 見つからない場合 == 予約ゼロ
+	// ここではすべてキャッシュに乗ってる前提なので、「空」は即ち予約ナシ。
+	for _, eid := range eventIDs {
+		deserialized := GetReservations(eid)
+		if len(deserialized) > 0 {
+			reservations = append(reservations, deserialized...)
+		}
+	}
+
+	return reservations
+}
+
+// HashSet appends the reservation to cache
+func HashSet(eventID int64, reservationID int64, reservation *Reservation) error {
 	muOfNCR.Lock()
 	defer muOfNCR.Unlock()
 
@@ -128,80 +132,25 @@ func (cli *MyRedisCli) HashSet(eventID int64, reservationID int64, reservation *
 	}
 	nonCanceledReservations[eventID][reservationID] = reservation
 	return nil
-
-	// key := "reservations.notCanceled.eid." + strconv.FormatInt(eventID, 10)
-	// bytes, err := json.Marshal(reservation)
-	// if err != nil {
-	// 	panic("MAP ERROR")
-	// }
-	// cli.HSet(key, strconv.FormatInt(reservationID, 10), bytes)
-	// return nil
 }
 
-func (cli *MyRedisCli) HashMSet(eventID int64, reservations []*Reservation) error {
+// HashMSet appends the reservations to cache
+func HashMSet(eventID int64, reservations []*Reservation) error {
 	if len(reservations) == 0 {
 		return nil
 	}
 	for _, reservation := range reservations {
-		cli.HashSet(reservation.EventID, reservation.ID, reservation)
+		HashSet(reservation.EventID, reservation.ID, reservation)
 	}
 	return nil
-
-	// // map []*Reservation to map[string]*Reservation{}
-	// reservationsMap := funk.Map(reservations, func(x *Reservation) (string, interface{}) {
-	// 	bytes, err := json.Marshal(x)
-	// 	if err != nil {
-	// 		panic("MAP ERROR")
-	// 	}
-	// 	return strconv.FormatInt(x.ID, 10), bytes
-	// }).(map[string]interface{})
-
-	// // log.Printf("HMSET: %v, len: %v", eventID, len(reservations))
-	// cli.HMSet("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), reservationsMap)
-	// return nil
 }
 
-func (cli *MyRedisCli) HashDelete(eventID int64, reservationID int64) error {
+// HashDelete deletes the key from cache
+func HashDelete(eventID int64, reservationID int64) error {
 	muOfNCR.Lock()
 	defer muOfNCR.Unlock()
 	delete(nonCanceledReservations[eventID], reservationID)
-	// cli.HDel("reservations.notCanceled.eid."+strconv.FormatInt(eventID, 10), strconv.FormatInt(reservationID, 10))
 	return nil
-}
-
-/**
- * MySQLとRedis併用
- */
-func (cli *MyRedisCli) FetchAndCacheReservations(db *sql.DB, eventIDs []int64) ([]*Reservation, error) {
-	var reservations []*Reservation
-
-	// search the cache for each item
-	// NOTE: 見つからない場合 == 予約ゼロ
-	// ここではすべてキャッシュに乗ってる前提なので、「空」は即ち予約ナシ。
-	{
-		// =========
-		bfTime := time.Now()
-		// =========
-
-		for _, eid := range eventIDs {
-			deserialized, err := cli.GetReservations(eid)
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			if len(deserialized) > 0 {
-				reservations = append(reservations, deserialized...)
-			}
-		}
-
-		// =========
-		afTime := time.Now()
-		log.Printf("##### [FetchAndCacheReservations] TIME: %f #####", afTime.Sub(bfTime).Seconds())
-		// =========
-	}
-
-	sort.Slice(reservations, func(i, j int) bool { return reservations[i].ReservedAtUnix < reservations[j].ReservedAtUnix })
-	return reservations, nil
 }
 
 func arrayToString(a []int64, delim string) string {

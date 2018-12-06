@@ -249,12 +249,7 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		bfTime := time.Now()
 		// =========
 
-		var err error
-		reservations, err = redisCli.FetchAndCacheReservations(db, eventIDs)
-		if err != nil {
-			log.Fatal(err)
-			return nil, err
-		}
+		reservations = myCache.GetReservationsAll(eventIDs)
 
 		// =========
 		afTime := time.Now()
@@ -310,19 +305,11 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	}
 
 	// ----- まず reservations 全部取得。その後APサーバで処理 -----
-	var reservations []*Reservation
-	var err error
-	{
-		reservations, err = redisCli.FetchAndCacheReservations(db, []int64{eventID})
-		if err != nil {
-			log.Fatal(err)
-			return nil, err
-		}
-	}
+	reservations := myCache.GetReservations(eventID)
 	// ---------------------------------------
 
 	// ----- シートを走査 ----------------------
-	err = addEventInfo(&event, reservations, loginUserID, true)
+	err := addEventInfo(&event, reservations, loginUserID, true)
 	if err != nil {
 		log.Fatal(err)
 		return nil, err
@@ -423,7 +410,7 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	utcTime := time.Now().UTC()
 	{
 		reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
-		redisCli.HashSet(event.ID, reservationID, &reservation)
+		myCache.HashSet(event.ID, reservationID, &reservation)
 	}
 
 	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
@@ -914,11 +901,8 @@ func main() {
 
 		{
 			// fetch the first reserved record of the event
-			reservations, err := redisCli.FetchAndCacheReservations(db, []int64{event.ID})
-			if err != nil {
-				log.Fatal(err)
-				return err
-			}
+			reservations := myCache.GetReservations(event.ID)
+
 			found := funk.Find(reservations, func(x *Reservation) bool {
 				return x.SheetID == sheet.ID
 			})
@@ -943,7 +927,7 @@ func main() {
 				sheetMap[event.ID][rank].Add(sheet)
 
 				// delete notCanceledReservations cache
-				redisCli.HashDelete(event.ID, reservation.ID)
+				myCache.HashDelete(event.ID, reservation.ID)
 
 				// sales用なので多少遅れても良さそう
 				// append to canceledReservations cache
@@ -1189,11 +1173,10 @@ func main() {
 			}
 
 			// キャンセルしてないもの、しているものすべてを取得する
-			for key := range events {
-				notCanceled, _ := redisCli.GetReservations(key)
-				if len(notCanceled) > 0 {
-					reservations = append(reservations, notCanceled...)
-				}
+			eventIDs := funk.Keys(events).([]int64)
+			notCanceled := myCache.GetReservationsAll(eventIDs)
+			if len(notCanceled) > 0 {
+				reservations = append(reservations, notCanceled...)
 			}
 
 			canceled := canceledReservations
