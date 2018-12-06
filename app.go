@@ -41,6 +41,8 @@
  * 68k    : /                : getEventsIn()を細かく並列化したりループの回数を減らしたり。
  * 69k    : /                : MySQLのbuffer_pool_sizeを128MB --> 1G、 max_connectionsを400へ。
  * 89k    : /                : /initialize で non-canceled reservations をキャッシュ。
+ * 110k   : /                : non-canceled reservations を redis --> on-memory キャッシュに変更。ついでにRWLock。
+ * ???k   : /actions/reserve : TODO
  *
  */
 package main
@@ -197,21 +199,17 @@ func getEvents(all bool) ([]*Event, error) {
 	ids := funk.Map(events, func(x *Event) int64 {
 		return x.ID
 	})
-	addedEvents, err := getEventsIn(ids.([]int64), -1)
+	addedEvents, err := getEventsIn(ids.([]int64), -1, false)
 
 	return addedEvents, nil
 }
 
-func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
+func getEventsIn(eventIDs []int64, loginUserID int64, useDetail bool) ([]*Event, error) {
 	var events []*Event
 	inClause := arrayToString(eventIDs, ",")
 
 	// EVENTS
 	{
-		// =========
-		// bfTime := time.Now()
-		// =========
-
 		sql := fmt.Sprintf("SELECT * FROM events WHERE id IN (%s)", inClause)
 		eventRows, err := db.Query(sql)
 		if err != nil {
@@ -234,11 +232,6 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 			}
 			events = append(events, &event)
 		}
-
-		// =========
-		// afTime := time.Now()
-		// log.Printf("##### FETCHALLEVENT TIME: %f #####", afTime.Sub(bfTime).Seconds())
-		// =========
 	}
 
 	// RESERVATIONS
@@ -274,7 +267,7 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 		for i := range events {
 			go func(i int) {
 				defer wg.Done()
-				err := addEventInfo(events[i], data[events[i].ID], loginUserID, false)
+				err := addEventInfo(events[i], data[events[i].ID], loginUserID, useDetail)
 				if err != nil {
 					panic(err)
 				}
@@ -390,6 +383,10 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64, 
  * INSERT INTO reservations
  */
 func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
+	// =========
+	bfTime := time.Now()
+	// =========
+
 	var reservationID int64
 	var sheet Sheet
 
@@ -416,6 +413,11 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	if err != nil {
 		return 0, Sheet{}, err
 	}
+
+	// =========
+	afTime := time.Now()
+	log.Printf("##### [tryInsertReservation] TIME: %f #####", afTime.Sub(bfTime).Seconds())
+	// =========
 
 	return reservationID, sheet, nil
 }
@@ -676,28 +678,17 @@ func main() {
 			eventIDs := funk.Map(recentReservations, func(x Reservation) int64 {
 				return x.EventID
 			})
-
-			// =========
-			// bfTime := time.Now()
-			// =========
-
-			events, err := getEventsIn(eventIDs.([]int64), -1)
+			events, err := getEventsIn(eventIDs.([]int64), -1, false)
 			if err != nil {
 				log.Fatal(err)
 				return err
 			}
 
-			// =========
-			// afTime := time.Now()
-			// log.Printf("##### TIME: %f #####", afTime.Sub(bfTime).Seconds())
-			// =========
-
 			for i := range recentReservations {
 				// 複数event取得後にアプリケーション側でFind
-				found := funk.Find(events, func(x *Event) bool {
+				foundEvent := funk.Find(events, func(x *Event) bool {
 					return x.ID == recentReservations[i].EventID
-				})
-				foundEvent := found.(*Event)
+				}).(*Event)
 
 				// 同じEventIDの場合あるので構造体のコピーが必要
 				cloned := *foundEvent
@@ -723,23 +714,32 @@ func main() {
 		}
 		defer rows.Close()
 
-		var recentEvents []*Event
+		var eventIDs []int64
 		for rows.Next() {
 			var eventID int64
 			if err := rows.Scan(&eventID); err != nil {
 				return err
 			}
-			event, err := getEvent(eventID, -1)
+			eventIDs = append(eventIDs, eventID)
+		}
+
+		// fetch events information
+		var recentEvents []*Event
+		if len(eventIDs) > 0 {
+			recentEvents, err = getEventsIn(eventIDs, -1, false)
 			if err != nil {
+				log.Fatal(err)
 				return err
 			}
-			for k := range event.Sheets {
-				event.Sheets[k].Detail = nil
-			}
-			recentEvents = append(recentEvents, event)
 		}
-		if recentEvents == nil {
-			recentEvents = make([]*Event, 0)
+
+		// sort with eventIDs order
+		if len(recentEvents) > 0 {
+			recentEvents = funk.Map(eventIDs, func(eid int64) *Event {
+				return funk.Find(recentEvents, func(e *Event) bool {
+					return e.ID == eid
+				}).(*Event)
+			}).([]*Event)
 		}
 
 		return c.JSON(200, echo.Map{
@@ -833,7 +833,17 @@ func main() {
 			return err
 		}
 
+		// =========
+		// bfTime := time.Now()
+		// =========
+
 		event, err := getEvent(eventID, user.ID)
+
+		// =========
+		// afTime := time.Now()
+		// log.Printf("##### [getEvent in /api/users/] TIME: %f #####", afTime.Sub(bfTime).Seconds())
+		// =========
+
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "invalid_event", 404)
