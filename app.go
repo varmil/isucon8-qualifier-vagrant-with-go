@@ -486,23 +486,47 @@ func main() {
 			panic(err)
 		}
 
+		// sheets
+		var sheets []*Sheet
+		var sheetMap map[int64]*Sheet
+		{
+			rows, err := db.Query("SELECT * FROM sheets")
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var sheet Sheet
+				if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+					return err
+				}
+				sheets = append(sheets, &sheet)
+			}
+
+			sheetMap = funk.Map(sheets, func(x *Sheet) (int64, *Sheet) {
+				return x.ID, x
+			}).(map[int64]*Sheet)
+		}
+
 		// insert non-reserved sheets
 		{
-			lenOfEvents := (50)
-			lenOfSheets := (1000)
+			lenOfSheets := int64(1000)
 
-			for ei := 1; ei <= lenOfEvents; ei++ {
+			// 初期状態で空きがあるのはeventID11,12,13のみ
+			for ei := 11; ei <= 13; ei++ {
 				lenOfRows := lenOfSheets
 				valueStrings := make([]string, 0, lenOfRows)
 				valueArgs := make([]interface{}, 0, lenOfRows*2)
 
-				for si := 1; si <= lenOfSheets; si++ {
-					valueStrings = append(valueStrings, "(?,?)")
+				for si := int64(1); si <= lenOfSheets; si++ {
+					valueStrings = append(valueStrings, "(?,?,?)")
 					valueArgs = append(valueArgs, ei)
 					valueArgs = append(valueArgs, si)
+					valueArgs = append(valueArgs, sheetMap[si].Rank)
 				}
 
-				stmt := fmt.Sprintf("INSERT INTO non_reserved_sheets (event_id, sheet_id) VALUES %s", strings.Join(valueStrings, ","))
+				stmt := fmt.Sprintf("INSERT INTO non_reserved_sheets (event_id, sheet_id, `rank`) VALUES %s", strings.Join(valueStrings, ","))
 				_, err := db.Exec(stmt, valueArgs...)
 				if err != nil {
 					panic(err)
@@ -738,47 +762,51 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		var sheet Sheet
-		var reservationID int64
-		for {
+		// TODO: tuning
+		var sheetID int64
+		{
 			tx, err := db.Begin()
 			if err != nil {
 				return err
 			}
 
-			if err := tx.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", event.ID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			if err := tx.QueryRow("SELECT sheet_id FROM non_reserved_sheets WHERE event_id = ? AND `rank` = ? ORDER BY RAND() LIMIT 1 FOR UPDATE", event.ID, params.Rank).Scan(&sheetID); err != nil {
 				if err == sql.ErrNoRows {
+					tx.Commit()
 					return resError(c, "sold_out", 409)
 				}
 				return err
 			}
 
-			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-			reservationID, err = res.LastInsertId()
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
+			_, err = tx.Exec("DELETE FROM non_reserved_sheets WHERE sheet_id = ?", sheetID)
 			if err := tx.Commit(); err != nil {
 				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
+				return err
+			}
+		}
+
+		var sheet Sheet
+		var reservationID int64
+		{
+			if err := db.QueryRow("SELECT * FROM sheets WHERE id = ?", sheetID).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+				return err
 			}
 
-			break
+			res, err := db.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+			if err != nil {
+				return err
+			}
+			reservationID, err = res.LastInsertId()
 		}
+
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
 			"sheet_num":  sheet.Num,
 		})
 	}, loginRequired)
+
+	// TODO: tuning
 	e.DELETE("/api/events/:id/sheets/:rank/:num/reservation", func(c echo.Context) error {
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
@@ -820,7 +848,7 @@ func main() {
 		}
 
 		var reservation Reservation
-		if err := tx.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at) FOR UPDATE", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+		if err := tx.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 			tx.Rollback()
 			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
@@ -833,6 +861,11 @@ func main() {
 		}
 
 		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		if _, err = tx.Exec("INSERT INTO non_reserved_sheets (event_id, sheet_id, `rank`) VALUES (?, ?, ?)", event.ID, sheet.ID, sheet.Rank); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -1035,7 +1068,7 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id order by reserved_at asc for update")
+		rows, err := db.Query("select r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id order by reserved_at asc")
 		if err != nil {
 			return err
 		}

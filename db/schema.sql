@@ -25,8 +25,10 @@ CREATE TABLE IF NOT EXISTS sheets (
 CREATE TABLE IF NOT EXISTS non_reserved_sheets (
     id          INTEGER UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     event_id    INTEGER UNSIGNED NOT NULL,
+    `rank`      VARCHAR(128)     NOT NULL,
     sheet_id    INTEGER UNSIGNED NOT NULL,
-    UNIQUE KEY event_id_and_sheet_id_idx (event_id, sheet_id)
+    KEY event_id_and_rank_idx (event_id, `rank`),
+    KEY sheet_id_idx (sheet_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS reservations (
