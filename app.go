@@ -71,7 +71,6 @@ import (
 	"github.com/json-iterator/go"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
-	"github.com/labstack/echo/middleware"
 	"github.com/patrickmn/go-cache"
 	funk "github.com/thoas/go-funk"
 
@@ -499,10 +498,10 @@ func main() {
 		templates: template.Must(template.New("").Delims("[[", "]]").Funcs(funcs).ParseGlob("views/*.tmpl")),
 	}
 	e.Use(session.Middleware(sessions.NewCookieStore([]byte("secret"))))
-	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
-		Format: "method=${method}, uri=${uri}, status=${status}, latency_human=${latency_human}\n",
-		Output: os.Stderr,
-	}))
+	// e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
+	// 	Format: "method=${method}, uri=${uri}, status=${status}, latency_human=${latency_human}\n",
+	// 	Output: os.Stderr,
+	// }))
 	e.GET("/", func(c echo.Context) error {
 		events, err := getEvents(false)
 		if err != nil {
@@ -1151,52 +1150,37 @@ func main() {
 			}
 
 			// キャンセルしてないもの、しているものすべてを取得する
+			// NOTE: 一時変数に代入するとRAMを大量に食うので、しないこと
 			eventIDs := funk.Keys(events).([]int64)
-			notCanceled := myCache.GetReservationsAll(eventIDs)
-			if len(notCanceled) > 0 {
-				reservations = append(reservations, notCanceled...)
-			}
-
-			canceled := canceledReservations
-			if len(canceled) > 0 {
-				reservations = append(reservations, canceled...)
-			}
+			reservations = append(reservations, myCache.GetReservationsAll(eventIDs)...)
+			reservations = append(reservations, canceledReservations...)
 		}
 
-		var wg sync.WaitGroup
-		var reports = make([]Report, len(reservations))
-		wg.Add(len(reservations))
+		// NOTE: ここも go func() で並列化するとSWAPが発生するので敢えて直列で。
+		var reports = []Report{}
+		for _, reservation := range reservations {
+			// get from map
+			event := events[reservation.EventID]
+			sheet := sheetsMap[reservation.SheetID]
 
-		for i, reservation := range reservations {
-			go func(reservation *Reservation, loopIndex int) {
-				defer wg.Done()
-
-				// get from map
-				event := events[reservation.EventID]
-				sheet := sheetsMap[reservation.SheetID]
-
-				report := Report{
-					ReservationID: reservation.ID,
-					UserID:        reservation.UserID,
-					SoldAt:        time.Unix(reservation.ReservedAtUnix, 0).Format("2006-01-02T15:04:05.000000Z"),
-					Rank:          sheet.Rank,
-					Num:           sheet.Num,
-					Price:         event.Price + sheet.Price,
-					EventID:       event.ID,
-				}
-				if reservation.CanceledAt != nil {
-					report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
-				} else if reservation.CanceledAtUnix != 0 {
-					report.CanceledAt = time.Unix(reservation.CanceledAtUnix, 0).Format("2006-01-02T15:04:05.000000Z")
-				}
-				reports[loopIndex] = report
-			}(reservation, i)
+			report := Report{
+				ReservationID: reservation.ID,
+				UserID:        reservation.UserID,
+				SoldAt:        time.Unix(reservation.ReservedAtUnix, 0).Format("2006-01-02T15:04:05.000000Z"),
+				Rank:          sheet.Rank,
+				Num:           sheet.Num,
+				Price:         event.Price + sheet.Price,
+				EventID:       event.ID,
+			}
+			if reservation.CanceledAt != nil {
+				report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+			} else if reservation.CanceledAtUnix != 0 {
+				report.CanceledAt = time.Unix(reservation.CanceledAtUnix, 0).Format("2006-01-02T15:04:05.000000Z")
+			}
+			reports = append(reports, report)
 		}
 
-		wg.Wait()
-
-		foo := renderReportCSV(c, &reports)
-		return foo
+		return renderReportCSV(c, &reports)
 	}, adminLoginRequired)
 
 	e.Logger.Fatal(e.Start(":8080"))
