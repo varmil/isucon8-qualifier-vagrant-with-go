@@ -1,57 +1,9 @@
-/**
- * ## REQUIREMENT
- * go get -u github.com/oxequa/realize
- * go get github.com/joho/godotenv
- * go get github.com/thoas/go-funk
- * go get github.com/patrickmn/go-cache
- * go get -u github.com/go-redis/redis
- * go get github.com/json-iterator/go
- *
- *
- * ## HOW TO SERVE
- * sudo -i -u isucon
- * cd /home/isucon/torb/webapp/go
- * GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/torb" --run
- *
- *
- * ## MySQL
- * sudo pkill mysql
- * sudo -u mysql /bin/sh /usr/bin/mysqld_safe --basedir=/usr &
- *
- *
- * ### SCORE LOG
- *   800  : SELECT FOR UPDATE が無駄に見えたので削除。
- *  4810  : getEvent() の reservations テーブルSELECTに関して N+1を解決。reservations.user_id に INDEX追加
- *  7700  : go-cacheを用いてsheetsをslice格納してキャッシュ。この時点でgetEvent()はもはやボトルネックではないが、まだ /api/events/:id/actions/reserve 自体は遅い。
- *  9510  : getEvents()が内部で大量にgetEvent()をcallしていたので、呼出回数を実質１回にした。 /api/users/:id が次のボトルネックっぽい。
- * 26078  : WIP getEventsInをcacheしたがrace conditionで弾かれるので、ロックを入れないと駄目かも
- * 19292  : WIP ↑引き続き。Cache更新タイミングをトランザクションのcommit後に変更することで若干緩和。/actions/reservations のFOR UPDATEを削除
- * 9k-29k : WIP ↑引き続き。 myCache.FetchAndCacheReservations() に順次置き換え
- * 37k    : WIP ↑引き続き。 マニュアルをもう一度読む。/admin/api/reports/sales が原因で負荷レベルが上がらない。ORDER BYせずとも何とPASSした。罠。
- *        : refactor goCache --> redis
- *        : refactor WATCH（SETNX）を使うか、HASH型にしてATOMICに書き換えできるようにする。
- * 25k    : INSERT時にSETNXでLockを入れる。SheetsCache利用。早めにLock解除。まだ不安定
- * 18k    : 更に速く正確にLOCK解除するためにINSERT時にReservationIDを手動で採番する。
- * 45k    : Vagrantfileをいじって、本番スペックに近づけた。UPDATE時のWATCH排除。まだ不安定。
- * 30-55k : /admin/api/reports/sales で go func を利用。rows.Scan がまだ遅い？
- * 40-68k : /admin/api/reports/sales : funk.Find() が遅すぎるのでMapにした。まだ遅い （win）
- * 25-45k : /admin/api/reports/sales : canceledReservationsをredisからオンメモリにした。次は /admin/ or /actions/reserve （mac）
- * 35-45k : /admin/          : go func() で addEventInfo() をtuning（mac）
- * 55k    : /actions/reserve : Mutex Lock を使わずにAtomic Queueで頑張った。MySQLのmax_connectionsを増やした。 http://wakariyasui.hatenablog.jp/entry/2015/04/28/005109
- * 68k    : /                : getEventsIn()を細かく並列化したりループの回数を減らしたり。
- * 69k    : /                : MySQLのbuffer_pool_sizeを128MB --> 1G、 max_connectionsを400へ。
- * 89k    : /                : /initialize で non-canceled reservations をキャッシュ。
- * 110k   : /                : non-canceled reservations を redis --> on-memory キャッシュに変更。ついでにRWLock。
- * 160k   : /actions/reserve : sync_reservation_mapでcmap利用。go func()を addEventInfo() で使うのやめた。
- * 80k    : to 2cpus, 1.2GB  : 1台構成にした。SWAP大量発生でスコア下がる
- * 117k   : to 2cpus, 1.0GB  : go func() を使うとSWAPが大量に発生するのであえて直列化してスコアを稼ぐ。
- *
- */
 package main
 
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -62,76 +14,137 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/foize/go.fifo"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
-	"github.com/json-iterator/go"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
-	"github.com/patrickmn/go-cache"
-	funk "github.com/thoas/go-funk"
-
-	myCache "torb/cache"
-	sess "torb/session"
-	. "torb/structs"
+	"github.com/labstack/echo/middleware"
 )
 
-func arrayToString(a []int64, delim string) string {
-	return strings.Trim(strings.Replace(fmt.Sprint(a), " ", delim, -1), "[]")
+type User struct {
+	ID        int64  `json:"id,omitempty"`
+	Nickname  string `json:"nickname,omitempty"`
+	LoginName string `json:"login_name,omitempty"`
+	PassHash  string `json:"pass_hash,omitempty"`
 }
 
-func cacheSheets() {
-	var sheets []Sheet
-	sheetsRows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-	if err != nil {
-		log.Fatal(err)
+type Event struct {
+	ID       int64  `json:"id,omitempty"`
+	Title    string `json:"title,omitempty"`
+	PublicFg bool   `json:"public,omitempty"`
+	ClosedFg bool   `json:"closed,omitempty"`
+	Price    int64  `json:"price,omitempty"`
+
+	Total   int                `json:"total"`
+	Remains int                `json:"remains"`
+	Sheets  map[string]*Sheets `json:"sheets,omitempty"`
+}
+
+type Sheets struct {
+	Total   int      `json:"total"`
+	Remains int      `json:"remains"`
+	Detail  []*Sheet `json:"detail,omitempty"`
+	Price   int64    `json:"price"`
+}
+
+type Sheet struct {
+	ID    int64  `json:"-"`
+	Rank  string `json:"-"`
+	Num   int64  `json:"num"`
+	Price int64  `json:"-"`
+
+	Mine           bool       `json:"mine,omitempty"`
+	Reserved       bool       `json:"reserved,omitempty"`
+	ReservedAt     *time.Time `json:"-"`
+	ReservedAtUnix int64      `json:"reserved_at,omitempty"`
+}
+
+type Reservation struct {
+	ID         int64      `json:"id"`
+	EventID    int64      `json:"-"`
+	SheetID    int64      `json:"-"`
+	UserID     int64      `json:"-"`
+	ReservedAt *time.Time `json:"-"`
+	CanceledAt *time.Time `json:"-"`
+
+	Event          *Event `json:"event,omitempty"`
+	SheetRank      string `json:"sheet_rank,omitempty"`
+	SheetNum       int64  `json:"sheet_num,omitempty"`
+	Price          int64  `json:"price,omitempty"`
+	ReservedAtUnix int64  `json:"reserved_at,omitempty"`
+	CanceledAtUnix int64  `json:"canceled_at,omitempty"`
+}
+
+type Administrator struct {
+	ID        int64  `json:"id,omitempty"`
+	Nickname  string `json:"nickname,omitempty"`
+	LoginName string `json:"login_name,omitempty"`
+	PassHash  string `json:"pass_hash,omitempty"`
+}
+
+func sessUserID(c echo.Context) int64 {
+	sess, _ := session.Get("session", c)
+	var userID int64
+	if x, ok := sess.Values["user_id"]; ok {
+		userID, _ = x.(int64)
 	}
-	defer sheetsRows.Close()
+	return userID
+}
 
-	for sheetsRows.Next() {
-		var sheet Sheet
-		if err := sheetsRows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			log.Fatal(err)
-		}
-		sheets = append(sheets, sheet)
+func sessSetUserID(c echo.Context, id int64) {
+	sess, _ := session.Get("session", c)
+	sess.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600,
+		HttpOnly: true,
 	}
-	goCache.Set("sheetsSlice", sheets, cache.DefaultExpiration)
+	sess.Values["user_id"] = id
+	sess.Save(c.Request(), c.Response())
+}
 
-	// { eventID: { sheetRank: Queue of []sheet } }
-	// set random sheetMap for new reservation
-	{
-		const EventLen = int64(18)
-		const MaxEventLen = int64(100)
-
-		sheets := funk.Shuffle(sheets).([]Sheet)
-		data := map[int64]map[string]*fifo.Queue{}
-
-		// 初期イベントは18個。11,12,13は全部空き。それ以外は全部埋まり。
-		// 100くらいまで作っておく
-		for eid := int64(1); eid <= MaxEventLen; eid++ {
-			// initialize the map
-			sheetMap := map[string]*fifo.Queue{
-				"S": fifo.NewQueue(),
-				"A": fifo.NewQueue(),
-				"B": fifo.NewQueue(),
-				"C": fifo.NewQueue(),
-			}
-			// set the map
-			data[eid] = sheetMap
-			// append if the event has non reserved sheets
-			if (eid >= 11 && eid <= 13) || eid > EventLen {
-				for _, s := range sheets {
-					sheetMap[s.Rank].Add(s)
-				}
-			}
-		}
-		goCache.Set("randomSheetMap", data, cache.DefaultExpiration)
+func sessDeleteUserID(c echo.Context) {
+	sess, _ := session.Get("session", c)
+	sess.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600,
+		HttpOnly: true,
 	}
+	delete(sess.Values, "user_id")
+	sess.Save(c.Request(), c.Response())
+}
+
+func sessAdministratorID(c echo.Context) int64 {
+	sess, _ := session.Get("session", c)
+	var administratorID int64
+	if x, ok := sess.Values["administrator_id"]; ok {
+		administratorID, _ = x.(int64)
+	}
+	return administratorID
+}
+
+func sessSetAdministratorID(c echo.Context, id int64) {
+	sess, _ := session.Get("session", c)
+	sess.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600,
+		HttpOnly: true,
+	}
+	sess.Values["administrator_id"] = id
+	sess.Save(c.Request(), c.Response())
+}
+
+func sessDeleteAdministratorID(c echo.Context) {
+	sess, _ := session.Get("session", c)
+	sess.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600,
+		HttpOnly: true,
+	}
+	delete(sess.Values, "administrator_id")
+	sess.Save(c.Request(), c.Response())
 }
 
 func loginRequired(next echo.HandlerFunc) echo.HandlerFunc {
@@ -153,7 +166,7 @@ func adminLoginRequired(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func getLoginUser(c echo.Context) (*User, error) {
-	userID := sess.SessUserID(c)
+	userID := sessUserID(c)
 	if userID == 0 {
 		return nil, errors.New("not logged in")
 	}
@@ -163,7 +176,7 @@ func getLoginUser(c echo.Context) (*User, error) {
 }
 
 func getLoginAdministrator(c echo.Context) (*Administrator, error) {
-	administratorID := sess.SessAdministratorID(c)
+	administratorID := sessAdministratorID(c)
 	if administratorID == 0 {
 		return nil, errors.New("not logged in")
 	}
@@ -196,92 +209,16 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 		events = append(events, &event)
 	}
-
-	ids := funk.Map(events, func(x *Event) int64 {
-		return x.ID
-	})
-	addedEvents, err := getEventsIn(ids.([]int64), -1)
-
-	return addedEvents, nil
-}
-
-func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
-	var events []*Event
-	inClause := arrayToString(eventIDs, ",")
-
-	// EVENTS
-	{
-		sql := fmt.Sprintf("SELECT * FROM events WHERE id IN (%s)", inClause)
-		eventRows, err := db.Query(sql)
+	for i, v := range events {
+		event, err := getEvent(v.ID, -1)
 		if err != nil {
-			log.Fatal(err)
 			return nil, err
 		}
-		defer eventRows.Close()
-		for eventRows.Next() {
-			var event Event
-			if err := eventRows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-
-			event.Sheets = map[string]*Sheets{
-				"S": &Sheets{},
-				"A": &Sheets{},
-				"B": &Sheets{},
-				"C": &Sheets{},
-			}
-			events = append(events, &event)
+		for k := range event.Sheets {
+			event.Sheets[k].Detail = nil
 		}
+		events[i] = event
 	}
-
-	// RESERVATIONS
-	var reservations []*Reservation
-	{
-		// =========
-		// bfTime := time.Now()
-		// =========
-
-		reservations = myCache.GetReservationsAll(eventIDs)
-
-		// =========
-		// afTime := time.Now()
-		// log.Printf("##### [getEventsIn] RESERVATIONS TIME: %f #####", afTime.Sub(bfTime).Seconds())
-		// =========
-	}
-
-	// ADD INFO
-	{
-
-		// slice to map[eventID][]*Reservation
-		data := map[int64][]*Reservation{}
-		for _, r := range reservations {
-			data[r.EventID] = append(data[r.EventID], r)
-		}
-
-		// =========
-		// bfTime := time.Now()
-		// =========
-
-		var wg sync.WaitGroup
-		wg.Add(len(events))
-		for i := range events {
-			go func(i int) {
-				defer wg.Done()
-				err := addEventInfo(events[i], data[events[i].ID], loginUserID, false)
-				if err != nil {
-					panic(err)
-				}
-			}(i)
-		}
-		wg.Wait()
-
-		// =========
-		// afTime := time.Now()
-		// log.Printf("##### [getEventsIn] ADD_EVENT_INFO TIME: %f #####", afTime.Sub(bfTime).Seconds())
-		// =========
-	}
-
 	return events, nil
 }
 
@@ -297,112 +234,38 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		"C": &Sheets{},
 	}
 
-	// ----- まず reservations 全部取得。その後APサーバで処理 -----
-	reservations := myCache.GetReservations(eventID)
-	// ---------------------------------------
-
-	// ----- シートを走査 ----------------------
-	err := addEventInfo(&event, reservations, loginUserID, true)
+	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
 	if err != nil {
-		log.Fatal(err)
 		return nil, err
 	}
-	// ---------------------------------------
+	defer rows.Close()
 
-	return &event, nil
-}
-
-func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64, useDetail bool) error {
-	// sheets テーブルは不変なのでキャッシュしている
-	x, _ := goCache.Get("sheetsSlice")
-	sheets := x.([]Sheet)
-
-	// 2重のforループを避けるためにmapにする
-	SRMap := map[int64]Reservation{}
-	for _, r := range reservations {
-		// 既にキーが存在する == 予約済み
-		if _, ok := SRMap[r.SheetID]; ok {
-			continue
+	for rows.Next() {
+		var sheet Sheet
+		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			return nil, err
 		}
-		SRMap[r.SheetID] = *r
-	}
-
-	// go funcを使わないほうが圧倒的に早い
-	for _, sheet := range sheets {
 		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-		atomic.AddInt32(&event.Total, 1)
-		atomic.AddInt32(&event.Sheets[sheet.Rank].Total, 1)
+		event.Total++
+		event.Sheets[sheet.Rank].Total++
 
-		// 最初に入っている予約を取得（最もReservedAtが早いものを取得）
-		if reservation, ok := SRMap[sheet.ID]; ok {
-			// シートに予約が入っている場合
+		var reservation Reservation
+		err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
+		if err == nil {
 			sheet.Mine = reservation.UserID == loginUserID
 			sheet.Reserved = true
-			sheet.ReservedAtUnix = reservation.ReservedAtUnix
+			sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
+		} else if err == sql.ErrNoRows {
+			event.Remains++
+			event.Sheets[sheet.Rank].Remains++
 		} else {
-			// そのシートに予約が入っていない場合
-			atomic.AddInt32(&event.Remains, 1)
-			atomic.AddInt32(&event.Sheets[sheet.Rank].Remains, 1)
+			return nil, err
 		}
 
-		if useDetail {
-			sheetCopy := Sheet{
-				ID:             sheet.ID,
-				Rank:           sheet.Rank,
-				Num:            sheet.Num,
-				Price:          sheet.Price,
-				Mine:           sheet.Mine,
-				Reserved:       sheet.Reserved,
-				ReservedAtUnix: sheet.ReservedAtUnix,
-			}
-			event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
-		}
+		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(4)
-	for rank, sheets := range event.Sheets {
-		go func(rank string, sheets *Sheets) {
-			defer wg.Done()
-			sort.Slice(sheets.Detail, func(i, j int) bool { return sheets.Detail[i].ID < sheets.Detail[j].ID })
-		}(rank, sheets)
-	}
-	wg.Wait()
-
-	return nil
-}
-
-/**
- * INSERT INTO reservations
- */
-func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, error) {
-
-	var reservationID int64
-	var sheet Sheet
-	x, _ := goCache.Get("randomSheetMap")
-
-	// ロックを使わないためにスレッドセーフなQueueを使ってAtomicに空席をPopする
-	// try to pop non-reserved sheet id from the queue
-	sheetMap := x.(map[int64]map[string]*fifo.Queue)
-	item := sheetMap[event.ID][rank].Next()
-	if item == nil {
-		return 0, Sheet{}, sql.ErrNoRows
-	}
-	sheet = item.(Sheet)
-
-	atomic.AddInt64(&reservationUUID, 1)
-	reservationID = atomic.LoadInt64(&reservationUUID)
-	utcTime := time.Now().UTC()
-	reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
-
-	myCache.HashSet(event.ID, reservationID, &reservation)
-
-	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
-	if err != nil {
-		return 0, Sheet{}, err
-	}
-
-	return reservationID, sheet, nil
+	return &event, nil
 }
 
 func sanitizeEvent(e *Event) *Event {
@@ -446,20 +309,8 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 }
 
 var db *sql.DB
-var goCache *cache.Cache
-var canceledRMX *sync.Mutex
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
-
-var reservationUUID int64 = 10000000
-var ErrCantAcquireLock = errors.New("cant acquire lock")
-
-// cache
-var canceledReservations []*Reservation
 
 func main() {
-	var err error
-	// log.SetFlags(log.Lshortfile)
-
 	{
 		err := godotenv.Load("../env.sh")
 		if err != nil {
@@ -467,27 +318,17 @@ func main() {
 		}
 	}
 
-	{
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
-			os.Getenv("DB_USER"), os.Getenv("DB_PASS"),
-			os.Getenv("DB_HOST"), os.Getenv("DB_PORT"),
-			os.Getenv("DB_DATABASE"),
-		)
-		// log.Printf("DSN IS %s", dsn)
-		db, err = sql.Open("mysql", dsn)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
+		os.Getenv("DB_USER"), os.Getenv("DB_PASS"),
+		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"),
+		os.Getenv("DB_DATABASE"),
+	)
 
-	// go-cache
-	{
-		goCache = cache.New(60*time.Minute, 120*time.Minute)
-		cacheSheets()
+	var err error
+	db, err = sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	// mutex
-	canceledRMX = new(sync.Mutex)
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -500,10 +341,11 @@ func main() {
 		templates: template.Must(template.New("").Delims("[[", "]]").Funcs(funcs).ParseGlob("views/*.tmpl")),
 	}
 	e.Use(session.Middleware(sessions.NewCookieStore([]byte("secret"))))
-	// e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
-	// 	Format: "method=${method}, uri=${uri}, status=${status}, latency_human=${latency_human}\n",
-	// 	Output: os.Stderr,
-	// }))
+	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
+		Format: "method=${method}, uri=${uri}, status=${status}, latency_human=${latency_human}\n",
+		Output: os.Stderr,
+	}))
+	e.Static("/", "public")
 	e.GET("/", func(c echo.Context) error {
 		events, err := getEvents(false)
 		if err != nil {
@@ -519,47 +361,12 @@ func main() {
 		})
 	}, fillinUser)
 	e.GET("/initialize", func(c echo.Context) error {
-		// db reset
 		cmd := exec.Command("../../db/init.sh")
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		err := cmd.Run()
 		if err != nil {
 			return nil
-		}
-
-		// go-cache reset
-		{
-			goCache.Flush()
-			cacheSheets()
-		}
-
-		// cache non-canceled reservations
-		{
-			myCache.InitNonCanceledReservations(db)
-		}
-
-		// cache canceled reservations
-		{
-			canceledReservations = nil
-
-			rows, err := db.Query("select id, event_id, user_id, sheet_id, reserved_at, canceled_at from reservations where canceled_at is not null")
-			if err != nil {
-				return err
-			}
-			defer rows.Close()
-
-			var reservations []*Reservation
-			for rows.Next() {
-				var reservation Reservation
-				if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.UserID, &reservation.SheetID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
-					return err
-				}
-				reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
-				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
-				reservations = append(reservations, &reservation)
-			}
-			canceledReservations = append(canceledReservations, reservations...)
 		}
 
 		return c.NoContent(204)
@@ -632,45 +439,28 @@ func main() {
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num); err != nil {
 				return err
 			}
+
+			event, err := getEvent(reservation.EventID, -1)
+			if err != nil {
+				return err
+			}
+			price := event.Sheets[sheet.Rank].Price
+			event.Sheets = nil
+			event.Total = 0
+			event.Remains = 0
+
+			reservation.Event = event
 			reservation.SheetRank = sheet.Rank
 			reservation.SheetNum = sheet.Num
+			reservation.Price = price
 			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
 			if reservation.CanceledAt != nil {
 				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
 			}
 			recentReservations = append(recentReservations, reservation)
 		}
-
 		if recentReservations == nil {
 			recentReservations = make([]Reservation, 0)
-		} else {
-			// eventまとめてfetch
-			eventIDs := funk.Map(recentReservations, func(x Reservation) int64 {
-				return x.EventID
-			})
-			events, err := getEventsIn(eventIDs.([]int64), -1)
-			if err != nil {
-				log.Fatal(err)
-				return err
-			}
-
-			for i := range recentReservations {
-				// 複数event取得後にアプリケーション側でFind
-				foundEvent := funk.Find(events, func(x *Event) bool {
-					return x.ID == recentReservations[i].EventID
-				}).(*Event)
-
-				// 同じEventIDの場合あるので構造体のコピーが必要
-				cloned := *foundEvent
-
-				price := cloned.Sheets[recentReservations[i].SheetRank].Price
-				cloned.Sheets = nil
-				cloned.Total = 0
-				cloned.Remains = 0
-
-				recentReservations[i].Price = price
-				recentReservations[i].Event = &cloned
-			}
 		}
 
 		var totalPrice int
@@ -684,32 +474,23 @@ func main() {
 		}
 		defer rows.Close()
 
-		var eventIDs []int64
+		var recentEvents []*Event
 		for rows.Next() {
 			var eventID int64
 			if err := rows.Scan(&eventID); err != nil {
 				return err
 			}
-			eventIDs = append(eventIDs, eventID)
-		}
-
-		// fetch events information
-		var recentEvents []*Event
-		if len(eventIDs) > 0 {
-			recentEvents, err = getEventsIn(eventIDs, -1)
+			event, err := getEvent(eventID, -1)
 			if err != nil {
-				log.Fatal(err)
 				return err
 			}
+			for k := range event.Sheets {
+				event.Sheets[k].Detail = nil
+			}
+			recentEvents = append(recentEvents, event)
 		}
-
-		// sort with eventIDs order
-		if len(recentEvents) > 0 {
-			recentEvents = funk.Map(eventIDs, func(eid int64) *Event {
-				return funk.Find(recentEvents, func(e *Event) bool {
-					return e.ID == eid
-				}).(*Event)
-			}).([]*Event)
+		if recentEvents == nil {
+			recentEvents = make([]*Event, 0)
 		}
 
 		return c.JSON(200, echo.Map{
@@ -743,7 +524,7 @@ func main() {
 			return resError(c, "authentication_failed", 401)
 		}
 
-		sess.SessSetUserID(c, user.ID)
+		sessSetUserID(c, user.ID)
 		user, err = getLoginUser(c)
 		if err != nil {
 			return err
@@ -751,7 +532,7 @@ func main() {
 		return c.JSON(200, user)
 	})
 	e.POST("/api/actions/logout", func(c echo.Context) error {
-		sess.SessDeleteUserID(c)
+		sessDeleteUserID(c)
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/api/events", func(c echo.Context) error {
@@ -786,8 +567,6 @@ func main() {
 		}
 		return c.JSON(200, sanitizeEvent(event))
 	})
-
-	// TODO: tuning
 	e.POST("/api/events/:id/actions/reserve", func(c echo.Context) error {
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
@@ -803,17 +582,7 @@ func main() {
 			return err
 		}
 
-		// =========
-		// bfTime := time.Now()
-		// =========
-
 		event, err := getEvent(eventID, user.ID)
-
-		// =========
-		// afTime := time.Now()
-		// log.Printf("##### [getEvent in /api/users/] TIME: %f #####", afTime.Sub(bfTime).Seconds())
-		// =========
-
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "invalid_event", 404)
@@ -827,16 +596,41 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		var reservationID int64
 		var sheet Sheet
-		reservationID, sheet, err = tryInsertReservation(user, event, params.Rank)
-		if err == sql.ErrNoRows {
-			// レスポンスを返すエラー
-			return resError(c, "sold_out", 409)
-		} else if err != nil {
-			return err
-		}
+		var reservationID int64
+		for {
+			if err := db.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", event.ID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+				if err == sql.ErrNoRows {
+					return resError(c, "sold_out", 409)
+				}
+				return err
+			}
 
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+
+			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+			if err != nil {
+				tx.Rollback()
+				log.Println("re-try: rollback by", err)
+				continue
+			}
+			reservationID, err = res.LastInsertId()
+			if err != nil {
+				tx.Rollback()
+				log.Println("re-try: rollback by", err)
+				continue
+			}
+			if err := tx.Commit(); err != nil {
+				tx.Rollback()
+				log.Println("re-try: rollback by", err)
+				continue
+			}
+
+			break
+		}
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
@@ -878,53 +672,35 @@ func main() {
 			return err
 		}
 
-		{
-			// fetch the first reserved record of the event
-			reservations := myCache.GetReservations(event.ID)
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
 
-			found := funk.Find(reservations, func(x *Reservation) bool {
-				return x.SheetID == sheet.ID
-			})
-			if found == nil {
-				log.Printf("NOT FOUND (DELETE RESERVATIONS)")
+		var reservation Reservation
+		if err := tx.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at) FOR UPDATE", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+			tx.Rollback()
+			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
 			}
-			reservation := *(found.(*Reservation))
+			return err
+		}
+		if reservation.UserID != user.ID {
+			tx.Rollback()
+			return resError(c, "not_permitted", 403)
+		}
 
-			if reservation.UserID != user.ID {
-				log.Printf("403 (DELETE RESERVATIONS) RUID: %v, sessionUID: %v", reservation.UserID, user.ID)
-				return resError(c, "not_permitted", 403)
-			}
+		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+			tx.Rollback()
+			return err
+		}
 
-			canceledAt := time.Now().UTC()
-
-			// update cache before commit DB
-			{
-				// append to non-reserved sheets cache
-				x, _ := goCache.Get("randomSheetMap")
-				sheetMap := x.(map[int64]map[string]*fifo.Queue)
-				sheetMap[event.ID][rank].Add(sheet)
-
-				// delete notCanceledReservations cache
-				myCache.HashDelete(event.ID, reservation.ID)
-
-				// sales用なので多少遅れても良さそう
-				// append to canceledReservations cache
-				reservation.CanceledAt = &canceledAt
-				reservation.CanceledAtUnix = canceledAt.Unix()
-				canceledRMX.Lock()
-				canceledReservations = append(canceledReservations, &reservation)
-				canceledRMX.Unlock()
-			}
-
-			if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", canceledAt.Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
-				return err
-			}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 
 		return c.NoContent(204)
 	}, loginRequired)
-
 	e.GET("/admin/", func(c echo.Context) error {
 		var events []*Event
 		administrator := c.Get("administrator")
@@ -963,7 +739,7 @@ func main() {
 			return resError(c, "authentication_failed", 401)
 		}
 
-		sess.SessSetAdministratorID(c, administrator.ID)
+		sessSetAdministratorID(c, administrator.ID)
 		administrator, err = getLoginAdministrator(c)
 		if err != nil {
 			return err
@@ -971,7 +747,7 @@ func main() {
 		return c.JSON(200, administrator)
 	})
 	e.POST("/admin/api/actions/logout", func(c echo.Context) error {
-		sess.SessDeleteAdministratorID(c)
+		sessDeleteAdministratorID(c)
 		return c.NoContent(204)
 	}, adminLoginRequired)
 	e.GET("/admin/api/events", func(c echo.Context) error {
@@ -1004,10 +780,6 @@ func main() {
 			tx.Rollback()
 			return err
 		}
-
-		// 本来ここでrandomSheetMap（go-cache）にINSERTすべきだが、初期化時にズルして
-		// 余分にイベント作成しているのでここでは何もしなくてOKのはず
-
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -1065,8 +837,6 @@ func main() {
 		if err != nil {
 			return err
 		}
-
-		// NOTE: Closedに変わったとしてもCacheは更新しない（あくまで予約席のキャッシュなので）
 		if _, err := tx.Exec("UPDATE events SET public_fg = ?, closed_fg = ? WHERE id = ?", params.Public, params.Closed, event.ID); err != nil {
 			tx.Rollback()
 			return err
@@ -1093,7 +863,7 @@ func main() {
 			return err
 		}
 
-		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC", event.ID)
+		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC FOR UPDATE", event.ID)
 		if err != nil {
 			return err
 		}
@@ -1120,72 +890,41 @@ func main() {
 			}
 			reports = append(reports, report)
 		}
-		return renderReportCSV(c, &reports)
+		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
-
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		// get cache of sheets
-		var sheetsMap map[int64]Sheet
-		if x, found := goCache.Get("sheetsSlice"); found {
-			sheets := x.([]Sheet)
-			sheetsMap = funk.Map(sheets, func(x Sheet) (int64, Sheet) {
-				return x.ID, x
-			}).(map[int64]Sheet)
+		rows, err := db.Query("select r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id order by reserved_at asc for update")
+		if err != nil {
+			return err
 		}
+		defer rows.Close()
 
-		var reservations []*Reservation
-		events := map[int64]Event{}
-		{
-			rows, _ := db.Query("select id, price from events")
-			defer rows.Close()
-			for rows.Next() {
-				var eid int64
-				var price int64
-				if err := rows.Scan(&eid, &price); err != nil {
-					return err
-				}
-				e := Event{
-					ID:    eid,
-					Price: price,
-				}
-				events[eid] = e
+		var reports []Report
+		for rows.Next() {
+			var reservation Reservation
+			var sheet Sheet
+			var event Event
+			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num, &sheet.Price, &event.ID, &event.Price); err != nil {
+				return err
 			}
-
-			// キャンセルしてないもの、しているものすべてを取得する
-			// NOTE: 一時変数に代入するとRAMを大量に食うので、しないこと
-			eventIDs := funk.Keys(events).([]int64)
-			reservations = append(reservations, myCache.GetReservationsAll(eventIDs)...)
-			reservations = append(reservations, canceledReservations...)
-		}
-
-		// NOTE: ここも go func() で並列化するとSWAPが発生するので敢えて直列で。
-		var reports = []Report{}
-		for _, reservation := range reservations {
-			// get from map
-			event := events[reservation.EventID]
-			sheet := sheetsMap[reservation.SheetID]
-
 			report := Report{
 				ReservationID: reservation.ID,
-				UserID:        reservation.UserID,
-				SoldAt:        time.Unix(reservation.ReservedAtUnix, 0).Format("2006-01-02T15:04:05.000000Z"),
+				EventID:       event.ID,
 				Rank:          sheet.Rank,
 				Num:           sheet.Num,
+				UserID:        reservation.UserID,
+				SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
 				Price:         event.Price + sheet.Price,
-				EventID:       event.ID,
 			}
 			if reservation.CanceledAt != nil {
 				report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
-			} else if reservation.CanceledAtUnix != 0 {
-				report.CanceledAt = time.Unix(reservation.CanceledAtUnix, 0).Format("2006-01-02T15:04:05.000000Z")
 			}
 			reports = append(reports, report)
 		}
-
-		return renderReportCSV(c, &reports)
+		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 
-	e.Logger.Fatal(e.Start(":8080"))
+	e.Start(":8080")
 }
 
 type Report struct {
@@ -1199,12 +938,11 @@ type Report struct {
 	Price         int64
 }
 
-func renderReportCSV(c echo.Context, reports *[]Report) error {
-	// ソートなしでもOKだった、、、罠
-	// sort.Slice(*reports, func(i, j int) bool { return strings.Compare((*reports)[i].SoldAt, (*reports)[j].SoldAt) < 0 })
+func renderReportCSV(c echo.Context, reports []Report) error {
+	sort.Slice(reports, func(i, j int) bool { return strings.Compare(reports[i].SoldAt, reports[j].SoldAt) < 0 })
 
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
-	for _, v := range *(reports) {
+	for _, v := range reports {
 		body.WriteString(fmt.Sprintf("%d,%d,%s,%d,%d,%d,%s,%s\n",
 			v.ReservationID, v.EventID, v.Rank, v.Num, v.Price, v.UserID, v.SoldAt, v.CanceledAt))
 	}
