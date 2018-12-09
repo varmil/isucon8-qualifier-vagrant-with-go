@@ -403,14 +403,14 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
 
 	// =========
-	bfTime := time.Now()
+	// bfTime := time.Now()
 	// =========
 
 	myCache.HashSet(event.ID, reservationID, &reservation)
 
 	// =========
-	afTime := time.Now()
-	log.Printf("##### [tryInsertReservation] TIME: %f #####", afTime.Sub(bfTime).Seconds())
+	// afTime := time.Now()
+	// log.Printf("##### [tryInsertReservation] TIME: %f #####", afTime.Sub(bfTime).Seconds())
 	// =========
 
 	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
@@ -462,7 +462,6 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 }
 
 var db *sql.DB
-var redisCli *myCache.MyRedisCli
 var goCache *cache.Cache
 var canceledRMX *sync.Mutex
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -495,12 +494,6 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-	}
-
-	// redis
-	{
-		redisCli = myCache.CreateRedisClient()
-		redisCli.FlushAll()
 	}
 
 	// go-cache
@@ -556,11 +549,6 @@ func main() {
 		{
 			goCache.Flush()
 			cacheSheets()
-		}
-
-		// redis reset
-		{
-			redisCli.FlushAll()
 		}
 
 		// cache non-canceled reservations
