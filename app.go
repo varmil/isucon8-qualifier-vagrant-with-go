@@ -199,12 +199,12 @@ func getEvents(all bool) ([]*Event, error) {
 	ids := funk.Map(events, func(x *Event) int64 {
 		return x.ID
 	})
-	addedEvents, err := getEventsIn(ids.([]int64), -1, false)
+	addedEvents, err := getEventsIn(ids.([]int64), -1)
 
 	return addedEvents, nil
 }
 
-func getEventsIn(eventIDs []int64, loginUserID int64, useDetail bool) ([]*Event, error) {
+func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	var events []*Event
 	inClause := arrayToString(eventIDs, ",")
 
@@ -251,9 +251,6 @@ func getEventsIn(eventIDs []int64, loginUserID int64, useDetail bool) ([]*Event,
 
 	// ADD INFO
 	{
-		// =========
-		// bfTime := time.Now()
-		// =========
 
 		// slice to map[eventID][]*Reservation
 		data := map[int64][]*Reservation{}
@@ -261,20 +258,23 @@ func getEventsIn(eventIDs []int64, loginUserID int64, useDetail bool) ([]*Event,
 			data[r.EventID] = append(data[r.EventID], r)
 		}
 
+		// =========
+		// bfTime := time.Now()
+		// =========
+
 		var wg sync.WaitGroup
 		wg.Add(len(events))
-
 		for i := range events {
 			go func(i int) {
 				defer wg.Done()
-				err := addEventInfo(events[i], data[events[i].ID], loginUserID, useDetail)
+				err := addEventInfo(events[i], data[events[i].ID], loginUserID, false)
 				if err != nil {
 					panic(err)
 				}
 			}(i)
 		}
-
 		wg.Wait()
+
 		// =========
 		// afTime := time.Now()
 		// log.Printf("##### [getEventsIn] ADD_EVENT_INFO TIME: %f #####", afTime.Sub(bfTime).Seconds())
@@ -316,57 +316,49 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64, 
 	x, _ := goCache.Get("sheetsSlice")
 	sheets := x.([]Sheet)
 
-	var wg sync.WaitGroup
-	wg.Add(len(sheets))
-	mx := new(sync.Mutex)
-
-	for i, sheet := range sheets {
-		go func(i int, sheet Sheet) {
-			defer wg.Done()
-
-			event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-			atomic.AddInt32(&event.Total, 1)
-			atomic.AddInt32(&event.Sheets[sheet.Rank].Total, 1)
-
-			// 最初に入っている予約（最もReservedAtが早いものを取得）
-			var reservation Reservation
-			for _, v := range reservations {
-				if v.SheetID == sheet.ID {
-					reservation = *v
-					break
-				}
-			}
-
-			if (Reservation{}) == reservation {
-				// そのシートに予約が入っていない場合
-				atomic.AddInt32(&event.Remains, 1)
-				atomic.AddInt32(&event.Sheets[sheet.Rank].Remains, 1)
-			} else {
-				// シートに予約が入っている場合
-				sheet.Mine = reservation.UserID == loginUserID
-				sheet.Reserved = true
-				sheet.ReservedAtUnix = reservation.ReservedAtUnix
-			}
-
-			if useDetail {
-				sheetCopy := Sheet{
-					ID:             sheet.ID,
-					Rank:           sheet.Rank,
-					Num:            sheet.Num,
-					Price:          sheet.Price,
-					Mine:           sheet.Mine,
-					Reserved:       sheet.Reserved,
-					ReservedAtUnix: sheet.ReservedAtUnix,
-				}
-				mx.Lock()
-				event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
-				mx.Unlock()
-			}
-		}(i, sheet)
+	// 2重のforループを避けるためにmapにする
+	SRMap := map[int64]Reservation{}
+	for _, r := range reservations {
+		// 既にキーが存在する == 予約済み
+		if _, ok := SRMap[r.SheetID]; ok {
+			continue
+		}
+		SRMap[r.SheetID] = *r
 	}
 
-	wg.Wait()
+	// go funcを使わないほうが圧倒的に早い
+	for _, sheet := range sheets {
+		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
+		atomic.AddInt32(&event.Total, 1)
+		atomic.AddInt32(&event.Sheets[sheet.Rank].Total, 1)
 
+		// 最初に入っている予約を取得（最もReservedAtが早いものを取得）
+		if reservation, ok := SRMap[sheet.ID]; ok {
+			// シートに予約が入っている場合
+			sheet.Mine = reservation.UserID == loginUserID
+			sheet.Reserved = true
+			sheet.ReservedAtUnix = reservation.ReservedAtUnix
+		} else {
+			// そのシートに予約が入っていない場合
+			atomic.AddInt32(&event.Remains, 1)
+			atomic.AddInt32(&event.Sheets[sheet.Rank].Remains, 1)
+		}
+
+		if useDetail {
+			sheetCopy := Sheet{
+				ID:             sheet.ID,
+				Rank:           sheet.Rank,
+				Num:            sheet.Num,
+				Price:          sheet.Price,
+				Mine:           sheet.Mine,
+				Reserved:       sheet.Reserved,
+				ReservedAtUnix: sheet.ReservedAtUnix,
+			}
+			event.Sheets[sheetCopy.Rank].Detail = append(event.Sheets[sheetCopy.Rank].Detail, &sheetCopy)
+		}
+	}
+
+	var wg sync.WaitGroup
 	wg.Add(4)
 	for rank, sheets := range event.Sheets {
 		go func(rank string, sheets *Sheets) {
@@ -402,16 +394,7 @@ func tryInsertReservation(user *User, event *Event, rank string) (int64, Sheet, 
 	utcTime := time.Now().UTC()
 	reservation := Reservation{ID: reservationID, EventID: event.ID, SheetID: sheet.ID, UserID: user.ID, ReservedAt: &utcTime, ReservedAtUnix: utcTime.Unix()}
 
-	// =========
-	bfTime := time.Now()
-	// =========
-
 	myCache.HashSet(event.ID, reservationID, &reservation)
-
-	// =========
-	afTime := time.Now()
-	log.Printf("##### [tryInsertReservation] TIME: %f #####", afTime.Sub(bfTime).Seconds())
-	// =========
 
 	_, err := db.Exec("INSERT INTO reservations (id, event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?, ?)", reservationID, event.ID, sheet.ID, user.ID, utcTime.Format("2006-01-02 15:04:05.000000"))
 	if err != nil {
@@ -462,7 +445,6 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 }
 
 var db *sql.DB
-var redisCli *myCache.MyRedisCli
 var goCache *cache.Cache
 var canceledRMX *sync.Mutex
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -497,12 +479,6 @@ func main() {
 		}
 	}
 
-	// redis
-	{
-		redisCli = myCache.CreateRedisClient()
-		redisCli.FlushAll()
-	}
-
 	// go-cache
 	{
 		goCache = cache.New(60*time.Minute, 120*time.Minute)
@@ -527,7 +503,6 @@ func main() {
 		Format: "method=${method}, uri=${uri}, status=${status}, latency_human=${latency_human}\n",
 		Output: os.Stderr,
 	}))
-	e.Static("/", "public")
 	e.GET("/", func(c echo.Context) error {
 		events, err := getEvents(false)
 		if err != nil {
@@ -556,11 +531,6 @@ func main() {
 		{
 			goCache.Flush()
 			cacheSheets()
-		}
-
-		// redis reset
-		{
-			redisCli.FlushAll()
 		}
 
 		// cache non-canceled reservations
@@ -677,7 +647,7 @@ func main() {
 			eventIDs := funk.Map(recentReservations, func(x Reservation) int64 {
 				return x.EventID
 			})
-			events, err := getEventsIn(eventIDs.([]int64), -1, false)
+			events, err := getEventsIn(eventIDs.([]int64), -1)
 			if err != nil {
 				log.Fatal(err)
 				return err
@@ -725,7 +695,7 @@ func main() {
 		// fetch events information
 		var recentEvents []*Event
 		if len(eventIDs) > 0 {
-			recentEvents, err = getEventsIn(eventIDs, -1, false)
+			recentEvents, err = getEventsIn(eventIDs, -1)
 			if err != nil {
 				log.Fatal(err)
 				return err

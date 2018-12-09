@@ -1,59 +1,55 @@
 package cache
 
 import (
-	"sync"
+	"strconv"
 	. "torb/structs"
+
+	"github.com/orcaman/concurrent-map"
 )
 
-// SyncReservationMap contains pointer of reservation with lock
+// SyncReservationMap contains cmap, the cmap has pointer of reservation as value
 type SyncReservationMap struct {
-	mu          sync.RWMutex
-	reservation map[int64]*Reservation
+	r cmap.ConcurrentMap
 }
 
-// cache of non-canceled reservations
+// NonCanceledReservations is the cache of non-canceled reservations
 // { eventID: { reservationID: struct-ptr } }
-var nonCanceledReservations = map[int64]*SyncReservationMap{}
+var NonCanceledReservations = map[int64]*SyncReservationMap{}
 
 // NewSyncReservationMap returns the instance
 func NewSyncReservationMap() *SyncReservationMap {
-	return &SyncReservationMap{reservation: map[int64]*Reservation{}}
+	return &SyncReservationMap{r: cmap.New()}
 }
 
 // Store the instance
 func (s *SyncReservationMap) Store(reservationID int64, value *Reservation) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.reservation[reservationID] = value
+	s.r.Set(toString(reservationID), value)
 }
 
 // Load the instance, return nil if not exists
 func (s *SyncReservationMap) Load(reservationID int64) *Reservation {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	t, ok := s.reservation[reservationID]
+	t, ok := s.r.Get(toString(reservationID))
 	if !ok {
 		return nil
 	}
-	return t
+	return t.(*Reservation)
 }
 
 // LoadAll the instances, return nil if not exists
 func (s *SyncReservationMap) LoadAll() []*Reservation {
 	var reservations []*Reservation
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	for _, reservation := range s.reservation {
-		reservations = append(reservations, reservation)
+	for _, reservation := range s.r.Items() {
+		reservations = append(reservations, reservation.(*Reservation))
 	}
 	return reservations
 }
 
 // Delete the instance
 func (s *SyncReservationMap) Delete(reservationID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.reservation, reservationID)
+	s.r.Remove(toString(reservationID))
+}
+
+func toString(n int64) string {
+	return strconv.FormatInt(n, 10)
 }
