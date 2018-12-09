@@ -806,9 +806,10 @@ func main() {
 			var id int64
 			if err := tx.QueryRow("SELECT id, sheet_id FROM non_reserved_sheets WHERE event_id = ? AND `rank` = ? ORDER BY RAND() LIMIT 1 FOR UPDATE", event.ID, params.Rank).Scan(&id, &sheetID); err != nil {
 				if err == sql.ErrNoRows {
-					tx.Commit()
+					tx.Rollback()
 					return resError(c, "sold_out", 409)
 				}
+				tx.Rollback()
 				return err
 			}
 
@@ -1104,7 +1105,7 @@ func main() {
 
 	// TODO: tuning
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select SQL_BIG_RESULT r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
+		rows, err := db.Query("select r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
 		if err != nil {
 			return err
 		}
@@ -1150,7 +1151,7 @@ type Report struct {
 }
 
 func renderReportCSV(c echo.Context, reports []Report) error {
-	sort.Slice(reports, func(i, j int) bool { return strings.Compare(reports[i].SoldAt, reports[j].SoldAt) < 0 })
+	// sort.Slice(reports, func(i, j int) bool { return strings.Compare(reports[i].SoldAt, reports[j].SoldAt) < 0 })
 
 	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
 	for _, v := range reports {
