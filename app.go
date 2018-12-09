@@ -43,6 +43,8 @@
  * 89k    : /                : /initialize で non-canceled reservations をキャッシュ。
  * 110k   : /                : non-canceled reservations を redis --> on-memory キャッシュに変更。ついでにRWLock。
  * 160k   : /actions/reserve : sync_reservation_mapでcmap利用。go func()を addEventInfo() で使うのやめた。
+ * 80k    : to 2cpus, 1.2GB  : 1台構成にした。SWAP大量発生でスコア下がる
+ * 117k   : to 2cpus, 1.0GB  : go func() を使うとSWAPが大量に発生するのであえて直列化してスコアを稼ぐ。
  *
  */
 package main
