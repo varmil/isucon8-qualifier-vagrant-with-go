@@ -478,12 +478,37 @@ func main() {
 		})
 	}, fillinUser)
 	e.GET("/initialize", func(c echo.Context) error {
-		cmd := exec.Command("./db/init.sh")
+		cmd := exec.Command("./src/torb/db/init.sh")
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		err := cmd.Run()
 		if err != nil {
-			return nil
+			panic(err)
+		}
+
+		// insert non-reserved sheets
+		{
+			lenOfEvents := (50)
+			lenOfSheets := (1000)
+
+			for ei := 1; ei <= lenOfEvents; ei++ {
+				lenOfRows := lenOfSheets
+				valueStrings := make([]string, 0, lenOfRows)
+				valueArgs := make([]interface{}, 0, lenOfRows*2)
+
+				for si := 1; si <= lenOfSheets; si++ {
+					valueStrings = append(valueStrings, "(?,?)")
+					valueArgs = append(valueArgs, ei)
+					valueArgs = append(valueArgs, si)
+				}
+
+				stmt := fmt.Sprintf("INSERT INTO non_reserved_sheets (event_id, sheet_id) VALUES %s", strings.Join(valueStrings, ","))
+				_, err := db.Exec(stmt, valueArgs...)
+				if err != nil {
+					panic(err)
+				}
+			}
+
 		}
 
 		return c.NoContent(204)
