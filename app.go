@@ -282,7 +282,11 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 	// ADD INFO
 	{
 		for i := range events {
-			err := addEventInfo(events[i], reservations, loginUserID)
+			found := funk.Filter(reservations, func(x *Reservation) bool {
+				return x.EventID == events[i].ID
+			}).([]*Reservation)
+
+			err := addEventInfo(events[i], found, loginUserID)
 			if err != nil {
 				log.Fatal(err)
 				return nil, err
@@ -362,7 +366,7 @@ func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) 
 		// sheet_idでfind
 		var reservation Reservation
 		for _, v := range reservations {
-			if v.SheetID == sheetCopy.ID && event.ID == v.EventID {
+			if v.SheetID == sheetCopy.ID {
 				reservation = *v
 				break
 			}
@@ -578,6 +582,8 @@ func main() {
 			"nickname": params.Nickname,
 		})
 	})
+
+	// TODO: tuning
 	e.GET("/api/users/:id", func(c echo.Context) error {
 		var user User
 		if err := db.QueryRow("SELECT id, nickname FROM users WHERE id = ?", c.Param("id")).Scan(&user.ID, &user.Nickname); err != nil {
@@ -605,28 +611,45 @@ func main() {
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num); err != nil {
 				return err
 			}
-
-			event, err := getEvent(reservation.EventID, -1)
-			if err != nil {
-				return err
-			}
-			price := event.Sheets[sheet.Rank].Price
-			event.Sheets = nil
-			event.Total = 0
-			event.Remains = 0
-
-			reservation.Event = event
 			reservation.SheetRank = sheet.Rank
 			reservation.SheetNum = sheet.Num
-			reservation.Price = price
 			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
 			if reservation.CanceledAt != nil {
 				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
 			}
 			recentReservations = append(recentReservations, reservation)
 		}
+
 		if recentReservations == nil {
 			recentReservations = make([]Reservation, 0)
+		} else {
+			// eventまとめてfetch
+			eventIDs := funk.Map(recentReservations, func(x Reservation) int64 {
+				return x.EventID
+			})
+			events, err := getEventsIn(eventIDs.([]int64), -1)
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+
+			for i := range recentReservations {
+				// 複数event取得後にアプリケーション側でFind
+				foundEvent := funk.Find(events, func(x *Event) bool {
+					return x.ID == recentReservations[i].EventID
+				}).(*Event)
+
+				// 同じEventIDの場合あるので構造体のコピーが必要
+				cloned := *foundEvent
+
+				price := cloned.Sheets[recentReservations[i].SheetRank].Price
+				cloned.Sheets = nil
+				cloned.Total = 0
+				cloned.Remains = 0
+
+				recentReservations[i].Price = price
+				recentReservations[i].Event = &cloned
+			}
 		}
 
 		var totalPrice int
@@ -640,23 +663,32 @@ func main() {
 		}
 		defer rows.Close()
 
-		var recentEvents []*Event
+		var eventIDs []int64
 		for rows.Next() {
 			var eventID int64
 			if err := rows.Scan(&eventID); err != nil {
 				return err
 			}
-			event, err := getEvent(eventID, -1)
+			eventIDs = append(eventIDs, eventID)
+		}
+
+		// fetch events information
+		var recentEvents []*Event
+		if len(eventIDs) > 0 {
+			recentEvents, err = getEventsIn(eventIDs, -1)
 			if err != nil {
+				log.Fatal(err)
 				return err
 			}
-			for k := range event.Sheets {
-				event.Sheets[k].Detail = nil
-			}
-			recentEvents = append(recentEvents, event)
 		}
-		if recentEvents == nil {
-			recentEvents = make([]*Event, 0)
+
+		// sort with eventIDs order
+		if len(recentEvents) > 0 {
+			recentEvents = funk.Map(eventIDs, func(eid int64) *Event {
+				return funk.Find(recentEvents, func(e *Event) bool {
+					return e.ID == eid
+				}).(*Event)
+			}).([]*Event)
 		}
 
 		return c.JSON(200, echo.Map{
@@ -770,7 +802,8 @@ func main() {
 				return err
 			}
 
-			if err := tx.QueryRow("SELECT sheet_id FROM non_reserved_sheets WHERE event_id = ? AND `rank` = ? ORDER BY RAND() LIMIT 1 FOR UPDATE", event.ID, params.Rank).Scan(&sheetID); err != nil {
+			var id int64
+			if err := tx.QueryRow("SELECT id, sheet_id FROM non_reserved_sheets WHERE event_id = ? AND `rank` = ? ORDER BY RAND() LIMIT 1 FOR UPDATE", event.ID, params.Rank).Scan(&id, &sheetID); err != nil {
 				if err == sql.ErrNoRows {
 					tx.Commit()
 					return resError(c, "sold_out", 409)
@@ -778,7 +811,7 @@ func main() {
 				return err
 			}
 
-			_, err = tx.Exec("DELETE FROM non_reserved_sheets WHERE sheet_id = ?", sheetID)
+			_, err = tx.Exec("DELETE FROM non_reserved_sheets WHERE id = ?", id)
 			if err := tx.Commit(); err != nil {
 				tx.Rollback()
 				return err
@@ -1070,7 +1103,7 @@ func main() {
 
 	// TODO: tuning
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("select r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
+		rows, err := db.Query("select SQL_BIG_RESULT r.*, s.rank as sheet_rank, s.num as sheet_num, s.price as sheet_price, e.id as event_id, e.price as event_price from reservations r inner join sheets s on s.id = r.sheet_id inner join events e on e.id = r.event_id")
 		if err != nil {
 			return err
 		}
