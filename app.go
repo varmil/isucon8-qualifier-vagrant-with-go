@@ -42,7 +42,7 @@
  * 69k    : /                : MySQLのbuffer_pool_sizeを128MB --> 1G、 max_connectionsを400へ。
  * 89k    : /                : /initialize で non-canceled reservations をキャッシュ。
  * 110k   : /                : non-canceled reservations を redis --> on-memory キャッシュに変更。ついでにRWLock。
- * ???k   : /actions/reserve : TODO
+ * 160k   : /actions/reserve : sync_reservation_mapでcmap利用。go func()を addEventInfo() で使うのやめた。
  *
  */
 package main
