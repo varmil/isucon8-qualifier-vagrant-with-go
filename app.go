@@ -76,6 +76,9 @@ import (
 	"github.com/patrickmn/go-cache"
 	funk "github.com/thoas/go-funk"
 
+	"net/http"
+	_ "net/http/pprof"
+
 	myCache "torb/cache"
 	sess "torb/session"
 	. "torb/structs"
@@ -466,6 +469,11 @@ func main() {
 			log.Fatal("Error loading .env file")
 		}
 	}
+
+	// pprof用
+	go func() {
+		log.Println(http.ListenAndServe("0.0.0.0:6060", nil))
+	}()
 
 	{
 		dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",

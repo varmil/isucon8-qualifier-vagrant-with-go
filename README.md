@@ -8,8 +8,79 @@ isucon8予選とほぼ同じ環境を構築するためのVagrantfileです。
 - vagrant実行環境を用意する
 - Vagrantfileがあるディレクトリで下記
   - `vagrant up`
-  - `vagrant rsync-auto` (※ターミナルをもう1枚開いて)
   - `vagrant ssh`
+
+
+
+## realizeでサーバ起動させるための手順
+０．（済）
+```
+# Vagrantfileに追記。rsyncでないとファイル変更検知不可。（app.goがVagrantfileと同じ階層にある前提）
+config.vm.synced_folder "./", "/home/isucon/torb/webapp/go/src/torb/", type: "rsync"
+```
+
+１．
+```
+# ホストのターミナルで新しくタブを開いて下記を実行
+vagrant rsync-auto
+```
+
+２．
+```
+# app.goのmain()の頭の方に下記を追加
+
+    {
+        err := godotenv.Load("../env.sh")
+        if err != nil {
+            log.Fatal("Error loading .env file")
+        }
+    }
+```
+
+３．
+```
+# VM内でのコマンド
+sudo -i -u isucon
+
+### デーモンを止める
+sudo systemctl stop    torb.perl
+sudo systemctl disable torb.perl
+sudo systemctl stop torb.go
+sudo systemctl disable torb.go
+
+### install the packages
+go get -u github.com/oxequa/realize github.com/joho/godotenv
+
+### サーバ起動（停止は ctrl + c）
+cd /home/isucon/torb/webapp/go
+GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/torb" --run
+```
+[参照実装の切り替え方法](https://github.com/isucon/isucon8-qualify/blob/master/doc/MANUAL.md#%E5%8F%82%E7%85%A7%E5%AE%9F%E8%A3%85%E3%81%AE%E5%88%87%E3%82%8A%E6%9B%BF%E3%81%88%E6%96%B9%E6%B3%95) も参照のこと
+
+
+
+## pprof設定
+１．（済）
+```
+# app.goのmain()の先頭に記述
+
+    go func() {
+        log.Println(http.ListenAndServe(":6060", nil))
+    }()
+```
+
+２．
+```
+# VM
+sudo systemctl stop firewalld
+sudo systemctl disable firewalld
+
+go get -u github.com/google/pprof
+sudo yum install -y graphviz
+
+# 30秒間プロファイリングし、その後HTTPサーバを8888で起動
+pprof -http="0.0.0.0:8888" localhost:6060/debug/pprof/profile
+```
 
 
 
@@ -25,29 +96,11 @@ bin/bench -remotes=127.0.0.1 -output result.json
 ## DEPENDENCY
 ```
 sudo -i -u isucon
-go get -u github.com/oxequa/realize
 go get -u github.com/joho/godotenv
 go get github.com/thoas/go-funk
 go get github.com/patrickmn/go-cache
-go get -u github.com/go-redis/redis
-
-# redis
-sudo yum install -y redis
-sudo systemctl start redis.service
-sudo systemctl enable redis.service
 ```
 
-
-
-## SERVE WITH REALIZE (live reloading)
-```
-sudo -i -u isucon
-sudo systemctl stop    torb.perl
-sudo systemctl disable torb.perl
-cd /home/isucon/torb/webapp/go
-GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/torb" --run
-```
-[参照実装の切り替え方法](https://github.com/isucon/isucon8-qualify/blob/master/doc/MANUAL.md#%E5%8F%82%E7%85%A7%E5%AE%9F%E8%A3%85%E3%81%AE%E5%88%87%E3%82%8A%E6%9B%BF%E3%81%88%E6%96%B9%E6%B3%95) も参照のこと
 
 
 ## 動作確認
@@ -71,7 +124,3 @@ macOS + VirtualBox 5.2.18 + Vagrant 2.1.5で動作確認済
 ### ブラウザで動作確認ができない
 
 `http://192.168.33.18/` にアクセスしてください。
-
-### Vagrantがない環境で試したい
-
-[isucon/isucon8-qualify](https://github.com/isucon/isucon8-qualify)をご利用ください。
