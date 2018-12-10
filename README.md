@@ -19,13 +19,7 @@ isucon8予選とほぼ同じ環境を構築するためのVagrantfileです。
 config.vm.synced_folder "./", "/home/isucon/torb/webapp/go/src/torb/", type: "rsync"
 ```
 
-１．
-```
-# ホストのターミナルで新しくタブを開いて下記を実行
-vagrant rsync-auto
-```
-
-２．
+１．（済）
 ```
 # app.goのmain()の頭の方に下記を追加
 
@@ -36,6 +30,13 @@ vagrant rsync-auto
         }
     }
 ```
+
+２．
+```
+# ホストのターミナルで新しくタブを開いて下記を実行
+vagrant rsync-auto
+```
+
 
 ３．
 ```
