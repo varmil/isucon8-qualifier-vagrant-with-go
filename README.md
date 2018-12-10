@@ -1,5 +1,3 @@
-# vagrant-isucon/isucon8-qualifier-standalone
-
 ## OVERVIEW
 
 isucon8予選とほぼ同じ環境を構築するためのVagrantfileです。
@@ -83,6 +81,8 @@ sudo yum install -y graphviz
 pprof -http="0.0.0.0:8888" localhost:6060/debug/pprof/profile
 ```
 
+３．
+`http://192.168.33.18:8888/` にアクセスしてください。
 
 
 ## RUN BENCH
