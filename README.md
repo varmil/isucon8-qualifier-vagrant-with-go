@@ -96,10 +96,8 @@ bin/bench -remotes=127.0.0.1 -output result.json
 
 ## DEPENDENCY
 ```
-sudo -i -u isucon
-go get -u github.com/joho/godotenv
-go get github.com/thoas/go-funk
-go get github.com/patrickmn/go-cache
+Local ： dep or 手動で。
+Remote : 手動
 ```
 
 
