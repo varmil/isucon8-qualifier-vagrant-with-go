@@ -66,14 +66,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/foize/go.fifo"
+	fifo "github.com/foize/go.fifo"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
-	"github.com/json-iterator/go"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
-	"github.com/patrickmn/go-cache"
+	cache "github.com/patrickmn/go-cache"
 	funk "github.com/thoas/go-funk"
 
 	"net/http"
