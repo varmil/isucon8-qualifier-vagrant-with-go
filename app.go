@@ -349,20 +349,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 var sheetsCache []*Sheet
 
 func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
-	// rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-	// if err != nil {
-	// 	return err
-	// }
-	// defer rows.Close()
-
-	// TODO: slow !
 	for _, sheet := range sheetsCache {
-		// for rows.Next() {
-		// var sheet Sheet
-		// if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-		// 	return err
-		// }
-
 		sheetCopy := Sheet{
 			ID:    sheet.ID,
 			Rank:  sheet.Rank,
@@ -891,35 +878,22 @@ func main() {
 			return err
 		}
 
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-
 		var reservation Reservation
-		if err := tx.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
-			tx.Rollback()
+		if err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
 			}
 			return err
 		}
 		if reservation.UserID != user.ID {
-			tx.Rollback()
 			return resError(c, "not_permitted", 403)
 		}
 
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
-			tx.Rollback()
+		if _, err = db.Exec("INSERT INTO non_reserved_sheets (event_id, sheet_id, `rank`) VALUES (?, ?, ?)", event.ID, sheet.ID, sheet.Rank); err != nil {
 			return err
 		}
 
-		if _, err = tx.Exec("INSERT INTO non_reserved_sheets (event_id, sheet_id, `rank`) VALUES (?, ?, ?)", event.ID, sheet.ID, sheet.Rank); err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
+		if _, err := db.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
 			return err
 		}
 
