@@ -346,18 +346,22 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	return &event, nil
 }
 
-func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
+var sheetsCache []*Sheet
 
-	for rows.Next() {
-		var sheet Sheet
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			return err
-		}
+func addEventInfo(event *Event, reservations []*Reservation, loginUserID int64) error {
+	// rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	// if err != nil {
+	// 	return err
+	// }
+	// defer rows.Close()
+
+	// TODO: slow !
+	for _, sheet := range sheetsCache {
+		// for rows.Next() {
+		// var sheet Sheet
+		// if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+		// 	return err
+		// }
 
 		sheetCopy := Sheet{
 			ID:    sheet.ID,
@@ -503,10 +507,9 @@ func main() {
 		}
 
 		// sheets
-		var sheets []*Sheet
 		var sheetMap map[int64]*Sheet
 		{
-			rows, err := db.Query("SELECT * FROM sheets")
+			rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
 			if err != nil {
 				return err
 			}
@@ -517,10 +520,10 @@ func main() {
 				if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 					return err
 				}
-				sheets = append(sheets, &sheet)
+				sheetsCache = append(sheetsCache, &sheet)
 			}
 
-			sheetMap = funk.Map(sheets, func(x *Sheet) (int64, *Sheet) {
+			sheetMap = funk.Map(sheetsCache, func(x *Sheet) (int64, *Sheet) {
 				return x.ID, x
 			}).(map[int64]*Sheet)
 		}
