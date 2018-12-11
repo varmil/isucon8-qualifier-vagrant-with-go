@@ -84,6 +84,7 @@ pprof -http="0.0.0.0:8888" localhost:6060/debug/pprof/profile
 ３．
 `http://192.168.33.18:8888/` にアクセスしてください。
 
+[dstatの使い方](https://blog.masu-mi.me/post/2015/02/28/dstat_options/)なども合わせて参照
 
 ## RUN BENCH
 ```
