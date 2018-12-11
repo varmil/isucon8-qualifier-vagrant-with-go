@@ -9,12 +9,15 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	_ "net/http/pprof"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
@@ -281,12 +284,16 @@ func getEventsIn(eventIDs []int64, loginUserID int64) ([]*Event, error) {
 
 	// ADD INFO
 	{
-		for i := range events {
-			found := funk.Filter(reservations, func(x *Reservation) bool {
-				return x.EventID == events[i].ID
-			}).([]*Reservation)
+		reservationMap := map[int64][]*Reservation{}
+		for _, r := range reservations {
+			if _, ok := reservationMap[r.EventID]; !ok {
+				reservationMap[r.EventID] = []*Reservation{}
+			}
+			reservationMap[r.EventID] = append(reservationMap[r.EventID], r)
+		}
 
-			err := addEventInfo(events[i], found, loginUserID)
+		for i := range events {
+			err := addEventInfo(events[i], reservationMap[events[i].ID], loginUserID)
 			if err != nil {
 				log.Fatal(err)
 				return nil, err
@@ -432,6 +439,10 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 var db *sql.DB
 
 func main() {
+	go func() {
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
+
 	{
 		err := godotenv.Load("../env.sh")
 		if err != nil {
