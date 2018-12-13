@@ -61,6 +61,10 @@ GOPATH=`pwd`:`pwd`/vendor:/home/isucon/go realize s --no-config --path="./src/to
 ## pprof設定
 １．（済）
 ```
+# app.goのimportに追加
+    "net/http"
+    _ "net/http/pprof"
+    
 # app.goのmain()の先頭に記述
 
     go func() {
